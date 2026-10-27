@@ -224,18 +224,97 @@ def test_baseline_indexes_localises_and_hints(dataset, tmp_path, session, keys):
     assert np.allclose(again.database, agent.database)
 
 
-def test_the_template_agent_is_a_complete_skeleton():
-    from pathlib import Path
-
+@pytest.mark.parametrize("use_filter", [True, False])
+def test_my_agent_drives_itself(dataset, tmp_path, session, use_filter):
     from my_agent import MyAgent
-    from vis_nav_sdk import Agent, SimError, preflight
 
-    agent = MyAgent(Path("data/none"))
-    for hook in ("setup", "act", "finish", "hud", "panel"):
-        assert getattr(MyAgent, hook) is not getattr(Agent, hook), f"{hook} not spelled out"
-    with pytest.raises(SimError, match="pre-flight") as caught:
-        preflight(agent)  # no attempt is spent on an act() that is not written yet
-    assert isinstance(caught.value.__cause__, NotImplementedError)
+    agent = MyAgent(
+        dataset,
+        n_clusters=4,
+        subsample=1,
+        top_k_shortcuts=3,
+        random_every=0,
+        cache_dir=tmp_path / "cache",
+        filter=use_filter,
+    )
+    result = run(agent, "vns_c_x", viewer=False, fps=None, quiet=True)
+    assert result is not None
+    assert session.calls
+    moves = {int(getattr(Action, name)) for name in ("FORWARD", "BACKWARD", "LEFT", "RIGHT")}
+    for action, repeat in session.calls:
+        assert action in moves
+        assert 0 < repeat <= P.MAX_REPEAT
+
+
+def test_my_agent_replays_the_raw_actions_between_nodes(dataset, tmp_path):
+    from my_agent import MyAgent, _moves
+
+    agent = MyAgent(
+        dataset,
+        n_clusters=4,
+        subsample=2,
+        top_k_shortcuts=3,
+        cache_dir=tmp_path / "cache",
+        capture_every=3,
+    )
+    # Records 0-11 with 5 combined: kept 0 1 2 3 4 6 7 8 9 10 11, then every 2nd.
+    assert agent.raw_index[:6] == [0, 2, 4, 7, 9, 11]
+    assert agent.segments[0, 1] == ["LEFT", "FORWARD"]
+    assert agent.segments[2, 3] == ["FORWARD", "LEFT"]  # record 5 dropped
+    assert agent.segments[3, 2] == ["RIGHT", "BACKWARD"]
+    assert _moves(["FORWARD"] * 4 + ["LEFT"], 3) == [("FORWARD", 12), ("LEFT", 3)]
+    long = _moves(["FORWARD"] * P.MAX_REPEAT, 2)
+    assert [t for _, t in long] == [P.MAX_REPEAT, P.MAX_REPEAT]
+    assert _moves(["LEFT"] * 7, 3, max_ticks=15) == [("LEFT", 15), ("LEFT", 6)]
+
+
+def test_my_agent_penalises_a_stalled_edge_and_resets(dataset, tmp_path):
+    import networkx as nx
+    from my_agent import MyAgent
+
+    agent = MyAgent(
+        dataset,
+        n_clusters=4,
+        subsample=1,
+        top_k_shortcuts=3,
+        cache_dir=tmp_path / "cache",
+        stall_window=2,
+        stall_penalty=5.0,
+    )
+    agent.setup(_info())
+    agent.goal, agent.estimate, agent.current = 5, 1, 1
+    agent.path = [1, 2, 3, 4, 5]
+    weight = agent.graph[1][2]["weight"]
+    for step in range(3):  # a first best, then two estimates without a better one
+        agent._guard(step)
+    hops = nx.shortest_path_length(agent.graph, 1, 5)
+    assert agent.stalls == [{"step": 2, "edge": (1, 2), "hops": hops}]
+    assert agent.graph[1][2]["weight"] == pytest.approx(5 * weight)
+    assert agent.queue and agent.edge is not None
+
+    agent.setup(_info())
+    assert agent.stalls == [] and agent.graph[1][2]["weight"] == weight
+
+
+def test_node_filter_follows_the_action_and_the_view():
+    import networkx as nx
+    from node_filter import NodeFilter
+    from vlad import Frame
+
+    graph = nx.path_graph(10)
+    frames = [Frame(Path(f"{i}.jpg"), "FORWARD", 0) for i in range(10)]
+    node_filter = NodeFilter(graph, frames, tau=0.01)
+    for matrix in node_filter.transitions.values():
+        assert np.allclose(matrix.sum(axis=1), 1)
+
+    node_filter.belief = np.eye(10)[3]
+    node_filter.predict("FORWARD")
+    assert node_filter.belief[4] > node_filter.belief[2]
+
+    node_filter.update(np.eye(10)[7])
+    node, confidence = node_filter.estimate()
+    assert node == 7
+    assert 0 < confidence <= 1
 
 
 def test_dotenv_fills_the_environment_without_overriding_it(tmp_path, monkeypatch):
@@ -253,3 +332,56 @@ def test_dotenv_fills_the_environment_without_overriding_it(tmp_path, monkeypatc
     assert os.environ["VIS_NAV_API_KEY"] == "k-from-file"
     assert os.environ["VIS_NAV_CHALLENGE"] == "from-shell"
     cli.load_dotenv(tmp_path / "missing.env")  # absent is fine
+
+
+def test_servo_finds_the_sign_and_size_of_a_shift(tmp_path):
+    import math
+
+    from servo import Servo
+
+    rng = np.random.default_rng(3)
+    scene = np.zeros((240, 480, 3), np.uint8)
+    for _ in range(150):
+        x, y = int(rng.integers(0, 470)), int(rng.integers(0, 230))
+        w, h = (int(v) for v in rng.integers(6, 30, 2))
+        color = tuple(int(c) for c in rng.integers(0, 255, 3))
+        cv2.rectangle(scene, (x, y), (x + w, y + h), color, -1)
+    left, right = scene[:, 40:360], scene[:, 80:400]  # right's view lies 40 px to the right
+    cv2.imwrite(str(tmp_path / "left.jpg"), left)
+    cv2.imwrite(str(tmp_path / "right.jpg"), right)
+    fx = 300.0
+    servo = Servo(fx)
+    expected = math.degrees(math.atan(40 / fx))
+
+    yaw, inliers = servo.yaw_offset(left, tmp_path / "right.jpg")
+    assert yaw is not None and inliers >= servo.min_matches
+    assert yaw == pytest.approx(expected, abs=1.0)
+    yaw, _ = servo.yaw_offset(right, tmp_path / "left.jpg")
+    assert yaw == pytest.approx(-expected, abs=1.0)
+    servo.yaw_offset(left, tmp_path / "right.jpg")
+    assert servo.image_features.cache_info().misses == 2  # cached by path
+
+    blank = np.zeros_like(left)
+    assert servo.yaw_offset(blank, tmp_path / "left.jpg") == (None, 0)
+
+
+def test_my_agent_servo_follows_the_raw_records_of_an_edge(dataset, tmp_path):
+    from my_agent import MyAgent
+
+    agent = MyAgent(
+        dataset, n_clusters=4, subsample=2, top_k_shortcuts=3, cache_dir=tmp_path / "cache"
+    )
+    # raw_index starts 0 2 4 7: edge 3 -> 2 walks records 7 down to 4, combined record 5 kept.
+    agent._follow((3, 2))
+    assert agent.span == [(0, 7), (0, 6), (0, 5), (0, 4)]
+    assert agent._record_image((0, 5)) == dataset / "traj_0" / "5.jpg"
+    assert agent._translation((2, 3)) == "FORWARD"
+    assert agent._translation((3, 2)) == "BACKWARD"
+
+    agent.setup(_info())
+    assert agent.servo is not None
+    agent.path, agent.goal = [3, 2, 1], 1
+    image = cv2.imread(str(agent._record_image((0, 6))))
+    agent._aim(image)  # the view is record 6's own: located there, aiming at record 5
+    assert agent.aimed and agent.located == (0, 6) and agent.target == (0, 5)
+    assert agent.follow == (3, 2) and agent.at == 1

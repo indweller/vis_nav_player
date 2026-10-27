@@ -101,7 +101,7 @@ def exploration_data(args: argparse.Namespace, data_dir: str | None) -> Path:
 
 def record_exploration_data(seed: int, dest: str | Path = "data") -> Path:
     """``data/local-<seed>/``: what a challenge on this maze would hand out -- three drives
-    through it, a frame every five ticks, ``target.jpg`` -- recorded here the first time."""
+    through it, a frame every tick, ``target.jpg`` -- recorded here the first time."""
     path = Path(dest) / f"local-{seed}"
     if (path / "target.jpg").exists():
         return path
@@ -117,6 +117,6 @@ def record_exploration_data(seed: int, dest: str | Path = "data") -> Path:
         raise SystemExit(str(exc)) from None
     print(f"recording exploration data for local maze {seed} into {path} ...", flush=True)
     world = sim.Simulator(textures, seed, motion_noise=sim.DEFAULT_NOISE, motion_seed=seed)
-    summary = world.record(path, routes=3, seed=seed, capture_every=5)
+    summary = world.record(path, routes=3, seed=seed, capture_every=1)
     print(f"exploration data: {path} ({summary['frames']} frames on {summary['routes']} routes)")
     return path
