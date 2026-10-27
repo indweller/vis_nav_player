@@ -171,6 +171,10 @@ class MapResult:
     """VLAD candidate pairs looked at."""
     seconds: dict[str, float] = field(default_factory=dict)
     counts: dict[str, int] = field(default_factory=dict)
+    dead_reckoned: list[np.ndarray] = field(default_factory=list)
+    """Per route, the ``(frames, 3)`` odometry poses (every frame, before the graph)."""
+    codebook: np.ndarray | None = None
+    """The VLAD codebook's ``(clusters, 128)`` centres, when the graph variant was built."""
 
     def save(self, directory: Path, prefix: str) -> None:
         """Each variant's occupancy grid to ``<directory>/<prefix>_<variant>.npz``."""
@@ -332,8 +336,9 @@ def fit_codebook(nodes: list[Node], extractor: Float32VLAD) -> None:
     ).fit(descriptors)
 
 
-def find_closures(tracked: list[Tracked], timer: Timer) -> tuple[list[Closure], int]:
-    """Verified loop closures between the routes' nodes, and the candidates looked at."""
+def find_closures(tracked: list[Tracked], timer: Timer) -> tuple[list[Closure], int, Float32VLAD]:
+    """Verified loop closures between the routes' nodes, the candidates looked at, and the
+    VLAD extractor (codebook) fitted on the nodes."""
     index = [(r, k) for r, t in enumerate(tracked) for k in range(len(t.nodes))]
     nodes = [tracked[r].nodes[k] for r, k in index]
     with timer.stage("vlad"):
@@ -364,7 +369,7 @@ def find_closures(tracked: list[Tracked], timer: Timer) -> tuple[list[Closure], 
                 closure = verify(nodes[a].view, nodes[b].view, index[a], index[b], rng)
                 if closure is not None:
                     closures.append(closure)
-    return closures, candidates
+    return closures, candidates, extractor
 
 
 def verify(
@@ -559,12 +564,14 @@ def build(
 
     result = MapResult({}, [], 0)
     result.counts = {k: sum(t.counts[k] for t in tracked) for k in tracked[0].counts}
+    result.dead_reckoned = [t.poses for t in tracked]
     if "odom" in variants:
         with timer.stage("grid"):
             poses = [t.poses[::NODE_EVERY] for t in tracked]
             result.variants["odom"] = Variant(poses, make_grid(tracked, poses))
     if "graph" in variants:
-        closures, result.candidates = find_closures(tracked, timer)
+        closures, result.candidates, extractor = find_closures(tracked, timer)
+        result.codebook = extractor.codebook.cluster_centers_.astype(np.float32)
         with timer.stage("optimise"):
             poses, kept = solve_rounds(tracked, starts, closures)
             for c in kept:
