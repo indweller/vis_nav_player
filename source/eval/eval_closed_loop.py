@@ -1,17 +1,18 @@
-"""
-MapAgent driving the local simulator, closed loop, against the ground truth.
+"""MapAgent driving the local simulator, closed loop, against the ground truth.
 
     uv run source/eval/eval_closed_loop.py
     uv run source/eval/eval_closed_loop.py --mazes 7 --goals found
 
 Per maze (7-12, the frozen maps of eval_goal_map) and goal variant -- "found": goal.find_goal on
-the target views; "true": the true target moved into the map frame, passed as MapAgent's
-``goal_override`` -- the agent drives a local session with motion noise on and a motion_seed other
-than the exploration's, frames JPEG-encoded as the server sends them. Every tick is logged: the
-true pose (world and map frame), the map-consistent truth (the true pose as the map has it: the
-mapped pose of the frame nearest the robot composed with the true relative pose from that frame),
-the estimate, sigma, the agent's mode and action, the navigator's replan, the fix, the wall guard
-and the true geodesic distance (cells, 4-connected) to the true goal.
+the target views; "true": the true target moved into the map frame by the one rigid frame of the
+first spawn, and "map-true": the true target as the map has it (the mapped pose of the exploration
+frame nearest it composed with the true relative pose, as MapTruth does for localisation), both
+passed as MapAgent's ``goal_override`` -- the agent drives a local session with motion noise on and
+a motion_seed other than the exploration's, frames JPEG-encoded as the server sends them. Every
+tick is logged: the true pose (world and map frame), the map-consistent truth (the true pose as the
+map has it: the mapped pose of the frame nearest the robot composed with the true relative pose
+from that frame), the estimate, sigma, the agent's mode and action, the navigator's replan, the
+fix, the wall guard and the true geodesic distance (cells, 4-connected) to the true goal.
 
 The run is scored by the simulator's check-in (distance, heading, tier, SPL, ticks), and then
 again by the SDK's own scorer, run(MapAgent(...), "local:<seed>") on the same noise and seed
@@ -20,13 +21,28 @@ in scores 0 points, tier "none". Per run also:
   - localisation error against the world truth (loc_) and the map-consistent truth (cm_);
   - wall-guard events, replans (by reason), accepted fixes and false fixes (accepted, then over
     0.3 m from the map-consistent truth), lost events;
+  - the final error decomposition (found and map-true runs): the goal's error against the
+    map-consistent goal (goal_cm_err_m), the final estimate against the goal the agent drove to
+    (final_to_goal_m), against the robot's map-consistent truth (final_cm_err_m), the heading
+    error at check-in (heading_deg) and the homing outcome (home_outcome: aligned = checked in
+    by the homing test, timed_out = --homing-max, no_homing; home_ticks, home_fixes);
   - the longest stretch of ticks with no new minimum of the geodesic distance to the goal;
-  - the fraction of ticks in each mode.
+  - the fraction of ticks in each mode, and the ticks by mode and by action (FORWARD, BACKWARD,
+    LEFT, RIGHT, the two arcs; LEFT + RIGHT are the ticks turning in place), the oracle's steps and
+    ``spl_ticks`` = oracle_steps / ticks;
+  - the planned paths: each plan's length before and after the navigator's shortcut, and the
+    shortcut segments (more than one hop pulled into one) whose true positions cross a true wall
+    (the segment's end points moved to the truth through the nearest mapped frame, as
+    MapTruth.consistent does, but backwards).
+
+The defaults are the baseline steering; ``--arcs`` steers with arcs and ``--shortcut`` shortcuts
+every plan (``--corridor-m``). The arcs' motion is measured on the
+simulator (no noise, 50 ticks each) and printed; MapAgent uses it where the sum of the FORWARD and
+turn means is off by over 20%.
 
 Writes to results/eval/closed_loop/: runs.csv, ticks.csv and <seed>_<goal>.png (true walls, true
-trajectory in black, estimated in blue, goal true in green and found in red, replans as orange
-dots and wall-guard events as red crosses, both at the robot's true position).
-"""
+trajectory in black, estimated in blue, goal true in green, map-true in blue and found in red,
+replans as orange dots and wall-guard events as red crosses, both at the robot's true position)."""
 
 from __future__ import annotations
 
@@ -44,14 +60,16 @@ from common import cell_of, fmt, geodesic, ints, textures, write_csv
 from eval_cues import Walls, stored_floor
 from eval_geometry import Frame
 from eval_map import MAP_COLOUR, Canvas, MapTruth, record, true_poses
+from eval_planning import segment_hits_rects
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import map_agent  # noqa: E402
+import mapping  # noqa: E402
 from vis_nav_sdk import Action, Observation, run  # noqa: E402
 from vis_nav_sdk.local import local_session  # noqa: E402
 
-GOALS = ("found", "true")
+GOALS = ("found", "true", "map-true")
 MODES = ("nav", "guard", "home", "search")
 REASONS = ("initial", "cross_track", "jump", "periodic")
 MOTION_SEED_OFFSET = 1000
@@ -60,6 +78,11 @@ MAX_STEPS = 3000
 FALSE_FIX_M = 0.3
 HELD_OUT = (10, 11, 12)
 BLOCKS = ("Distance", "Heading", "SPL")
+ACTIONS = ("FORWARD", "BACKWARD", "LEFT", "RIGHT", "FORWARD|LEFT", "FORWARD|RIGHT")
+ARC_SEEDS = (7, 8)
+ARC_TICKS = 50
+ARC_RUN = 5
+"""Ticks of an arc taken from one start."""
 FIELDS = [
     "seed",
     "goal",
@@ -84,7 +107,22 @@ FIELDS = [
     "lost_events",
     "stall_ticks",
     *(f"mode_{m}" for m in MODES),
+    "oracle_steps",
+    "spl_ticks",
+    *(f"ticks_{m}" for m in MODES),
+    *(f"act_{a.lower().replace('|', '_')}" for a in ACTIONS),
+    "turn_ticks",
+    "plans",
+    "path_before_m",
+    "path_after_m",
+    "pulled_segments",
+    "pulled_crossing",
     "final_err_m",
+    "final_to_goal_m",
+    "final_cm_err_m",
+    "home_outcome",
+    "home_ticks",
+    "home_fixes",
     "score_points",
     "score_max",
     "score_distance",
@@ -123,7 +161,6 @@ TICK_FIELDS = [
     "geodesic",
     "home_view",
     "home_yaw",
-    "home_offset",
 ]
 
 
@@ -154,6 +191,42 @@ class Maze:
             float(v) for v in self.frame.to_map(np.array([self.world.target]))[0]
         )
         self.consistent_goal = self.truth.consistent(self.world.target)
+
+    def true_xy(self, point: np.ndarray) -> np.ndarray:
+        """A map-frame position in the world: through the mapped frame nearest it, its true pose
+        and the map's pose of it (the inverse of MapTruth.consistent)."""
+        n = int(np.argmin(np.hypot(*(self.truth.store.xy - point).T)))
+        x, y, yaw = self.truth.store.pose(n)
+        turn = self.truth.poses[n, 2] - yaw
+        c, s = math.cos(turn), math.sin(turn)
+        dx, dy = point[0] - x, point[1] - y
+        return self.truth.poses[n, :2] + np.array([c * dx - s * dy, s * dx + c * dy])
+
+    def crosses_wall(self, a: np.ndarray, b: np.ndarray) -> bool:
+        return segment_hits_rects(self.walls.rects, self.true_xy(a), self.true_xy(b))
+
+
+def measure_arcs() -> dict[str, dict]:
+    """The motion of one tick of FORWARD|LEFT and FORWARD|RIGHT in the robot's frame, on the
+    simulator without noise: the median over ARC_TICKS ticks of each, ARC_RUN at a time from the
+    spawns of ARC_SEEDS facing the four ways (the median is robust to a tick a wall blocks)."""
+    world = sim.Simulator(textures(), ARC_SEEDS[0])
+    steps: dict[str, list] = {"FORWARD|LEFT": [], "FORWARD|RIGHT": []}
+    starts = [(seed, k) for seed in ARC_SEEDS for k in range(4)]
+    for i in range(math.ceil(ARC_TICKS / ARC_RUN)):
+        seed, k = starts[i % len(starts)]
+        for name, turn in (("FORWARD|LEFT", sim.LEFT), ("FORWARD|RIGHT", sim.RIGHT)):
+            world.reset(seed)
+            if k:
+                world.step(sim.LEFT, round(k * 90.0 / map_agent.DEFAULT_TURN_DEG))
+            for _ in range(ARC_RUN):
+                before = world.pose()
+                world.step(sim.FORWARD | turn, 1)
+                steps[name].append(mapping.between(before, world.pose()))
+    return {
+        name: dict(zip(("dx", "dy", "dyaw"), np.median(s, axis=0).tolist(), strict=True))
+        for name, s in steps.items()
+    }
 
 
 def drive(agent: ServerFrames, maze: Maze, args) -> dict:
@@ -191,6 +264,7 @@ def drive(agent: ServerFrames, maze: Maze, args) -> dict:
                 "guard": agent.guarded,
                 "geodesic": float(maze.geodesic[cell_of(maze.world, maze.free, *pose[:2])]),
                 "view": agent.view,
+                "path": update.path if update.replan else None,
             }
         )
         if decision & Action.CHECKIN:
@@ -209,6 +283,7 @@ def drive(agent: ServerFrames, maze: Maze, args) -> dict:
         "lost_events": agent.localiser.lost_events,
         "reason": agent.checkin_reason or "budget",
         "goal": agent.goal,
+        "oracle_steps": maze.world.oracle_steps,
     }
 
 
@@ -263,6 +338,11 @@ def score_run(maze: Maze, goal: str, run_: dict, sdk) -> tuple[dict, list[dict]]
     reasons = Counter(t["replan"] for t in log if t["replan"])
     modes = Counter(t["mode"] for t in log)
     result, arrival = run_["result"], run_["arrival"]
+    actions = Counter(t["action"] for t in log)
+    paths = [t["path"] for t in log if t["path"] is not None]
+    shortcut = [p for p in paths if math.isfinite(p.length_before)]
+    pulled = [seg for p in shortcut for seg in p.pulled]
+    crossing = sum(maze.crosses_wall(a, b) for a, b in pulled)
     row = {
         "seed": maze.seed,
         "goal": goal,
@@ -284,7 +364,26 @@ def score_run(maze: Maze, goal: str, run_: dict, sdk) -> tuple[dict, list[dict]]
         "lost_events": run_["lost_events"],
         "stall_ticks": longest_stall([t["geodesic"] for t in log]),
         **{f"mode_{m}": modes[m] / len(log) for m in MODES},
+        "oracle_steps": run_["oracle_steps"],
+        "spl_ticks": min(1.0, run_["oracle_steps"] / max(run_["nav_steps"], 1)),
+        **{f"ticks_{m}": modes[m] for m in MODES},
+        **{f"act_{a.lower().replace('|', '_')}": actions[a] for a in ACTIONS},
+        "turn_ticks": actions["LEFT"] + actions["RIGHT"],
+        "plans": len(paths),
+        "path_before_m": (
+            float(np.mean([p.length_before for p in shortcut])) if shortcut else math.nan
+        ),
+        "path_after_m": float(np.mean([p.length for p in shortcut])) if shortcut else math.nan,
+        "pulled_segments": len(pulled),
+        "pulled_crossing": crossing,
         "final_err_m": float(world_error[-1]),
+        "final_to_goal_m": math.dist(log[-1]["estimate"][:2], run_["goal"][:2]),
+        "final_cm_err_m": float(cm_error[-1]),
+        "home_outcome": {"homed": "aligned", "homing_max": "timed_out"}.get(
+            run_["reason"], "no_homing" if modes["home"] == 0 else "cut_short"
+        ),
+        "home_ticks": modes["home"],
+        "home_fixes": sum(t["fixed"] for t in log if t["mode"] == "home"),
         "score_points": 0.0 if sdk is None else sdk.points,
         "score_max": 10.0 if sdk is None else sdk.max_points,
         "score_distance": 0.0 if sdk is None else sdk.awarded.get("Distance", 0.0),
@@ -320,7 +419,6 @@ def score_run(maze: Maze, goal: str, run_: dict, sdk) -> tuple[dict, list[dict]]
                 "geodesic": t["geodesic"],
                 "home_view": "" if t["view"] is None else t["view"][0],
                 "home_yaw": "" if t["view"] is None else t["view"][1],
-                "home_offset": "" if t["view"] is None else t["view"][2],
             }
         )
     return row, ticks
@@ -345,6 +443,7 @@ def draw(maze: Maze, run_: dict, found: tuple, row: dict, path: Path) -> None:
         if t["guard"]:
             cv2.drawMarker(canvas.image, centre, (0, 0, 220), cv2.MARKER_TILTED_CROSS, 8, 2)
     canvas.marker(tuple(maze.world.target), (0, 170, 0), arrow=True)
+    canvas.marker(maze.frame.pose_to_world(tuple(maze.consistent_goal)), (220, 100, 0), arrow=True)
     canvas.marker(maze.frame.pose_to_world(found), (0, 0, 220), arrow=True)
     canvas.label(
         f"maze {maze.seed} goal={row['goal']}: {row['tier']} {row['distance_m']:.2f} m "
@@ -370,7 +469,11 @@ def evaluate(seed: int, args, out: Path) -> tuple[list[dict], list[dict]]:
     rows, ticks, runs = [], [], {}
     found = maze.true_goal
     for goal in args.goals:
-        agent.goal_override = maze.true_goal if goal == "true" else None
+        agent.goal_override = {
+            "found": None,
+            "true": maze.true_goal,
+            "map-true": tuple(maze.consistent_goal),
+        }[goal]
         run_ = drive(agent, maze, args)
         if goal == "found" and run_["goal"] is not None:
             found = run_["goal"]
@@ -384,7 +487,7 @@ def evaluate(seed: int, args, out: Path) -> tuple[list[dict], list[dict]]:
         ticks.extend(tick_rows)
         runs[goal] = run_
         print(
-            f"  {goal:<5} {row['tier']:<7} {row['distance_m']:.2f} m "
+            f"  {goal:<8} {row['tier']:<7} {row['distance_m']:.2f} m "
             f"{row['heading_deg']:>5.0f} deg {row['ticks']:>5} ticks ({row['checkin_reason']})  "
             f"points {row['score_points']:g}",
             flush=True,
@@ -399,6 +502,12 @@ def agent_options(args) -> dict:
     return {
         "lookahead_m": args.lookahead_m,
         "turn_tol": args.turn_tol,
+        "arc_deg": args.arc_deg,
+        "arcs": args.arcs,
+        "max_turn_ticks": args.max_turn_ticks,
+        "shortcut": args.shortcut,
+        "corridor_m": args.corridor_m,
+        "arc_measured": args.arc_measured,
         "forward_ticks": args.forward_ticks,
         "guard_m": args.guard_m,
         "near_m": args.near_m,
@@ -410,7 +519,7 @@ def agent_options(args) -> dict:
 
 def summarise(rows: list[dict]) -> None:
     head = (
-        f"{'maze':>4} {'goal':<5} | {'tier':<7} {'dist':>5} {'head':>5} {'spl':>5} {'ticks':>5} "
+        f"{'maze':>4} {'goal':<8} | {'tier':<7} {'dist':>5} {'head':>5} {'spl':>5} {'ticks':>5} "
         f"{'check-in':<10} | {'points':>6} {'D/H/S':>7} | {'loc med':>7} {'cm med':>6} "
         f"{'false':>5} {'lost':>4} | {'guard':>5} {'replans':>7} {'stall':>5} | "
         + " ".join(f"{m:>6}" for m in MODES)
@@ -419,13 +528,55 @@ def summarise(rows: list[dict]) -> None:
     for r in rows:
         blocks = "/".join(f"{r[f'score_{b.lower()}']:g}" for b in BLOCKS)
         print(
-            f"{r['seed']:>4} {r['goal']:<5} | {r['tier']:<7} {fmt(r['distance_m'], 2):>5} "
+            f"{r['seed']:>4} {r['goal']:<8} | {r['tier']:<7} {fmt(r['distance_m'], 2):>5} "
             f"{fmt(r['heading_deg'], 0):>5} {r['spl']:>5.2f} {r['ticks']:>5} "
             f"{r['checkin_reason']:<10} | {r['score_points']:>3g}/{r['score_max']:<2g} "
             f"{blocks:>7} | {fmt(r['loc_median_m'], 2):>7} {fmt(r['cm_median_m'], 2):>6} "
             f"{r['false_fixes']:>5} {r['lost_events']:>4} | {r['wall_guard']:>5} "
             f"{r['replans']:>7} {r['stall_ticks']:>5} | "
             + " ".join(f"{r[f'mode_{m}']:>6.2f}" for m in MODES)
+        )
+    print("\nticks by action, mode, and SPL (oracle_steps / ticks):")
+    print(
+        f"{'maze':>4} {'goal':<8} | {'ticks':>5} {'oracle':>6} {'spl':>5} | "
+        + " ".join(f"{a.replace('FORWARD', 'FWD'):>9}" for a in ACTIONS)
+        + f" | {'turning':>7} | "
+        + " ".join(f"{m:>5}" for m in MODES)
+        + f" | {'D':>4} {'H':>4} {'S':>5}"
+    )
+    for r in rows:
+        print(
+            f"{r['seed']:>4} {r['goal']:<8} | {r['ticks']:>5} {r['oracle_steps']:>6} "
+            f"{r['spl_ticks']:>5.2f} | "
+            + " ".join(f"{r['act_' + a.lower().replace('|', '_')]:>9}" for a in ACTIONS)
+            + f" | {r['turn_ticks']:>7} | "
+            + " ".join(f"{r[f'ticks_{m}']:>5}" for m in MODES)
+            + f" | {r['score_distance']:>4g} {r['score_heading']:>4g} {r['score_spl']:>5.2f}"
+        )
+    shortcut = [r for r in rows if math.isfinite(r["path_before_m"])]
+    if shortcut:
+        print("\nplanned paths (mean per plan) and shortcut segments crossing a true wall:")
+        for r in shortcut:
+            print(
+                f"{r['seed']:>4} {r['goal']:<8} | {r['plans']:>3} plans "
+                f"{r['path_before_m']:.2f} -> {r['path_after_m']:.2f} m | "
+                f"{r['pulled_crossing']}/{r['pulled_segments']} shortcut segments cross a wall"
+            )
+        print(
+            f"  all: {sum(r['pulled_crossing'] for r in shortcut)}/"
+            f"{sum(r['pulled_segments'] for r in shortcut)} cross a wall"
+        )
+    print("\nfinal error decomposition (metres; heading at check-in in degrees):")
+    print(
+        f"{'maze':>4} {'goal':<8} | {'goal vs cm':>10} {'est vs goal':>11} {'est vs cm':>9} "
+        f"{'heading':>7} | {'homing':<9} {'ticks':>5} {'fixes':>5} | {'arrival':>7}"
+    )
+    for r in (r for r in rows if r["goal"] != "true"):
+        print(
+            f"{r['seed']:>4} {r['goal']:<8} | {fmt(r['goal_cm_err_m'], 2):>10} "
+            f"{fmt(r['final_to_goal_m'], 2):>11} {fmt(r['final_cm_err_m'], 2):>9} "
+            f"{fmt(r['heading_deg'], 0):>7} | {r['home_outcome']:<9} {r['home_ticks']:>5} "
+            f"{r['home_fixes']:>5} | {fmt(r['distance_m'], 2):>7}"
         )
     print("\nmean points / max points:")
     for goal in GOALS:
@@ -453,6 +604,11 @@ def main() -> None:
     p.add_argument("--no-sdk", action="store_true", help="skip the SDK scorer's second run")
     p.add_argument("--lookahead-m", type=float, default=map_agent.LOOKAHEAD_M)
     p.add_argument("--turn-tol", type=float, default=map_agent.TURN_TOL_DEG)
+    p.add_argument("--arc-deg", type=float, default=map_agent.ARC_DEG)
+    p.add_argument("--arcs", action="store_true", help="steer with FORWARD+turn arcs")
+    p.add_argument("--max-turn-ticks", type=int, default=None)
+    p.add_argument("--shortcut", action="store_true", help="string-pull every plan")
+    p.add_argument("--corridor-m", type=float, default=map_agent.planner_module.CORRIDOR_M)
     p.add_argument("--forward-ticks", type=int, default=map_agent.FORWARD_TICKS)
     p.add_argument("--guard-m", type=float, default=map_agent.GUARD_M)
     p.add_argument("--near-m", type=float, default=map_agent.NEAR_M)
@@ -463,6 +619,10 @@ def main() -> None:
     args.goals = [g for g in args.goals.split(",") if g]
 
     stored_floor()
+    args.arc_measured = measure_arcs()
+    print("measured arc motion (sim, no noise, per tick):")
+    for name, m in args.arc_measured.items():
+        print(f"  {name:<14} dx {m['dx']:.4f} dy {m['dy']:.4f} dyaw {m['dyaw']:.4f}")
     out = Path(args.out_dir) / "closed_loop"
     rows: list[dict] = []
     ticks: list[dict] = []

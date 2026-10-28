@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "source" / "eval"))
 
 from eval_planning import segment_hits_rects  # noqa: E402
 from frozen_map import FrozenMap  # noqa: E402
-from geometry import Camera, FloorMask, layout_score  # noqa: E402
+from geometry import Camera, FloorMask, OccupancyMap, layout_score  # noqa: E402
 from localiser import Localiser  # noqa: E402
 from planner import NODE_EVERY, PlaceGraph, bresenham, crosses_occupied  # noqa: E402
 from planner import Path as Route  # noqa: E402
@@ -250,3 +250,43 @@ def test_frozen_map_neighbours_stay_on_the_route():
     )
     assert list(store.neighbours(1, 5)) == [0, 1, 2, 3]
     assert list(store.neighbours(7, 2)) == [5, 6, 7, 8, 9]
+
+
+def shortcut_store(wall_x: float | None = None) -> SimpleNamespace:
+    """Mapped frames along an L (x then y, 0.02 m apart), and a grid with a wall at ``wall_x``."""
+    t = np.arange(0.0, 1.0001, 0.02)
+    xy = np.concatenate([np.column_stack([t, 0 * t]), np.column_stack([0 * t + 1, t])])
+    log_odds = np.zeros((40, 40), np.float32)
+    if wall_x is not None:
+        log_odds[:, int(np.floor((wall_x + 1.0) / 0.05))] = 5.0
+    grid = OccupancyMap(half_extent=1.0, res=0.05)
+    grid.log_odds = log_odds
+    return SimpleNamespace(xy=xy, grid=grid)
+
+
+def test_shortcut_keeps_the_corner_of_an_l():
+    # The diagonal of the L is far from every frame: the corner stays.
+    path = Route(
+        np.array([[0, 0, 0], [0.5, 0, 0], [1, 0, 0], [1, 0.5, 0], [1, 1, 0]], float), [1, 2, 3]
+    )
+    short = path.shortcut(shortcut_store())
+    assert short.waypoints[:, :2].tolist() == [[0, 0], [1, 0], [1, 1]]
+    assert short.nodes == [2]
+    assert short.length_before == pytest.approx(2.0)
+    assert short.length == pytest.approx(2.0)
+    assert len(short.pulled) == 2
+
+
+def test_shortcut_cuts_a_corner_within_the_corridor():
+    path = Route(
+        np.array([[0, 0, 0], [0.5, 0, 0], [1, 0, 0], [1, 0.5, 0], [1, 1, 0]], float), [1, 2, 3]
+    )
+    short = path.shortcut(shortcut_store(), corridor_m=0.5)
+    assert short.waypoints[:, :2].tolist() == [[0, 0], [1, 1]]
+    assert short.length < short.length_before
+
+
+def test_shortcut_stops_at_a_wall():
+    path = Route(np.array([[0, 0, 0], [0.5, 0, 0], [1, 0, 0]], float), [1])
+    assert len(path.shortcut(shortcut_store()).waypoints) == 2
+    assert len(path.shortcut(shortcut_store(wall_x=0.5)).waypoints) == 3

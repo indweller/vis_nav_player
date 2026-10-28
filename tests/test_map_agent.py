@@ -74,3 +74,41 @@ def test_reaches_checkin(tiny_maze, override):
     assert result is not None
     assert agent.checkin_reason in ("low_steps", "homed", "homing_max")
     assert result.nav_steps <= MAX_STEPS
+
+
+def test_arc_motion_sums_the_means_unless_the_measure_differs():
+    from map_agent import arc_motion
+
+    motion = {
+        "FORWARD": {"dx": 0.03, "dy": 0.0, "dyaw": 0.0002},
+        "LEFT": {"dx": 0.0, "dy": 0.0, "dyaw": 0.058},
+        "RIGHT": {"dx": 0.0, "dy": 0.0, "dyaw": -0.057},
+    }
+    arcs, off = arc_motion(motion)
+    assert arcs["FORWARD|LEFT"]["dx"] == pytest.approx(0.03)
+    assert arcs["FORWARD|LEFT"]["dyaw"] == pytest.approx(0.0582)
+    assert off["FORWARD|LEFT"] != off["FORWARD|LEFT"]  # NaN
+    close = {"FORWARD|LEFT": {"dx": 0.03, "dy": 0.0, "dyaw": 0.06}}
+    assert arc_motion(motion, close)[0]["FORWARD|LEFT"]["dyaw"] == pytest.approx(0.0582)
+    far = {"FORWARD|LEFT": {"dx": 0.03, "dy": 0.0, "dyaw": 0.03}}
+    arcs, off = arc_motion(motion, far)
+    assert arcs["FORWARD|LEFT"]["dyaw"] == pytest.approx(0.03)
+    assert off["FORWARD|LEFT"] > 0.2
+
+
+def test_steering_bands():
+    agent = MapAgent.__new__(MapAgent)
+    agent.turn_tol, agent.arc_deg, agent.max_turn_ticks = 12.0, 45.0, 26
+    agent.forward_ticks, agent.turn_rate = 2, 3.4375
+    agent.arcs, agent.arc_radius = True, 0.5
+    assert agent._steer(5.0) == ["FORWARD"] * 2
+    assert agent._steer(-30.0) == ["FORWARD|RIGHT"]
+    assert agent._steer(30.0) == ["FORWARD|LEFT"]
+    assert agent._steer(90.0) == ["LEFT"] * 26
+    assert agent._steer(-60.0) == ["RIGHT"] * 17
+    assert agent._steer(-170.0) == ["RIGHT"] * 26
+    # A waypoint 0.3 m away at 40 degrees is inside the turning circle (0.64 m): turn first.
+    assert agent._steer(40.0, 0.3) == ["LEFT"] * 12
+    assert agent._steer(40.0, 0.7) == ["FORWARD|LEFT"]
+    agent.arcs = False
+    assert agent._steer(30.0, 1.0) == ["LEFT"] * 9

@@ -33,6 +33,12 @@ LINK_INLIERS = 15
 """SIFT epipolar inliers two frames need to share for a link."""
 CONNECT_M = 0.15
 """Start and goal poses join every node this near (the nearest one if none is)."""
+CORRIDOR_M = 0.08
+"""A shortcut stays this near some mapped frame's position."""
+CORRIDOR_STEP_M = 0.02
+"""Spacing of the points a shortcut segment is checked at."""
+SHORTCUT_LOG_ODDS = 4.0
+"""A shortcut crosses no cell of the grid with at least this log-odds."""
 
 Pose = tuple[float, float, float]
 
@@ -47,6 +53,10 @@ class Path:
     """Metres along the waypoints."""
     arc: np.ndarray = field(init=False, repr=False)
     """Metres from the start to each waypoint."""
+    length_before: float = field(default=math.nan, repr=False)
+    """Metres of the path before ``shortcut`` (NaN if it was not shortcut)."""
+    pulled: list[tuple[np.ndarray, np.ndarray]] = field(default_factory=list, repr=False)
+    """The segments (start, end points) ``shortcut`` made from more than one hop."""
 
     def __post_init__(self) -> None:
         self.waypoints = np.asarray(self.waypoints, float).reshape(-1, 3)
@@ -69,6 +79,41 @@ class Path:
         distance = np.hypot(*(a + t[:, None] * d - p).T)
         i = int(np.argmin(distance))
         return float(distance[i]), float(self.arc[i] + t[i] * math.sqrt(length2[i]))
+
+    def shortcut(
+        self,
+        store,
+        corridor_m: float = CORRIDOR_M,
+        tree: cKDTree | None = None,
+        log_odds: float = SHORTCUT_LOG_ODDS,
+    ) -> Path:
+        """Greedy string-pulling: from each kept waypoint, jump to the farthest later one whose
+        straight segment is safe, and drop those between. A segment is safe if every point on it
+        (CORRIDOR_STEP_M apart) is within ``corridor_m`` of some mapped frame position of
+        ``store`` (``tree`` is a cKDTree of ``store.xy``) and it crosses no cell of ``store.grid``
+        with log-odds of at least ``log_odds``. The start and the goal stay."""
+        tree = cKDTree(store.xy) if tree is None else tree
+        blocked = store.grid.log_odds >= log_odds
+        xy = self.waypoints[:, :2]
+        keep, pulled = [0], []
+        i = 0
+        while i < len(xy) - 1:
+            j = next(
+                (
+                    j
+                    for j in range(len(xy) - 1, i + 1, -1)
+                    if safe(store, tree, blocked, xy[i], xy[j], corridor_m)
+                ),
+                i + 1,
+            )
+            if j > i + 1:
+                pulled.append((xy[i].copy(), xy[j].copy()))
+            keep.append(j)
+            i = j
+        nodes = [self.nodes[k - 1] for k in keep[1:-1]]
+        path = Path(self.waypoints[keep], nodes)
+        path.length_before, path.pulled = self.length, pulled
+        return path
 
     def waypoint_after(self, progress: float, ahead: float) -> Pose:
         """The first waypoint at least ``ahead`` metres beyond ``progress`` (the last if none)."""
@@ -108,6 +153,19 @@ def crosses_occupied(grid, a: np.ndarray, b: np.ndarray) -> bool:
     return any(
         0 <= r < size and 0 <= c < size and occupied[r, c] for r, c in bresenham(r0, c0, r1, c1)
     )
+
+
+def safe(
+    store, tree: cKDTree, blocked: np.ndarray, a: np.ndarray, b: np.ndarray, corridor_m: float
+) -> bool:
+    """Whether the segment ``a`` to ``b`` stays within ``corridor_m`` of the mapped frame
+    positions (KD-tree ``tree``) and off the ``blocked`` cells of ``store.grid``."""
+    n = max(2, int(math.ceil(math.dist(a, b) / CORRIDOR_STEP_M)) + 1)
+    points = a + np.linspace(0.0, 1.0, n)[:, None] * (b - a)
+    if (tree.query(points)[0] > corridor_m).any():
+        return False
+    row, col, inside = store.grid.cells(points)
+    return not blocked[row[inside], col[inside]].any()
 
 
 class PlaceGraph:

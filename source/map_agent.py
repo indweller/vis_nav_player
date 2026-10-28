@@ -10,18 +10,26 @@ and a navigator plans to the goal.
 Each tick the navigator localises (given the move just made), replans if it must, and the agent
 aims at the point --lookahead-m ahead on the path. Moves are held as queues of single ticks, so
 the localiser sees every frame:
-  - heading error to the waypoint over --turn-tol: turn toward it for clip(round(error / turn
-    rate), 1, 3) ticks; else FORWARD for --forward-ticks;
+  - heading error to the waypoint at most --turn-tol: FORWARD for --forward-ticks; over it: turn
+    toward it for clip(round(error / turn rate), 1, --max-turn-ticks) ticks (3; 26 with --arcs).
+    With --arcs, an error up to --arc-deg is one tick of an arc (FORWARD with LEFT or RIGHT)
+    instead.
+    Arcs have no calibration of their own: the localiser's fallback motion for one is the FORWARD
+    and turn means summed (``arc_motion``). An arc turns on a circle of radius R = step / turn per
+    tick and never reaches a waypoint inside the circle (closer than 2 R sin(error)): it orbits
+    it, so such an error is turned in place instead;
+  - with --shortcut, every plan is string-pulled (``Path.shortcut``, --corridor-m);
   - wall guard: a FORWARD with the centre column's wall range under --guard-m becomes BACKWARD
     for 2 ticks, and the path is replanned;
-  - homing, once the estimate is within --near-m of the goal (and from then on): the frame is
-    matched against the four goal views by SIFT (servo.py) to find which view it is looking at
-    and so the yaw to view 0; turn until that is under --align-deg; then, if the rigid relative
-    pose to that view puts the goal over --offset-m away, step toward it, a tick at a time (along
-    the heading if it is off that way only; else turn to it and drive, aligning again once
-    there); CHECKIN when aligned and within --offset-m, or after --homing-max homing decisions.
-    The views match only within about 0.1 m of the goal; without a match, the estimate stands
-    in for the yaw and the offset.
+  - homing, once the estimate is within --near-m of the goal (and from then on): the localiser
+    tries a fix every tick against the mapped frames within 0.5 m of the goal (its SIFT and layout
+    checks). The target is the goal pose. The frame is matched against the four goal views by
+    SIFT (servo.py) to find which view it is looking at and so the yaw to view 0 (the estimate's
+    when none matches; the views match only within about 0.1 m of the goal). Turn until that is
+    under --align-deg; then, if the estimate is over --offset-m from the goal, step toward it, a
+    tick at a time (along the heading if it is off that way only; else turn to it and drive,
+    aligning again once there); CHECKIN when aligned and within --offset-m, or after --homing-max
+    homing decisions.
   - CHECKIN when fewer than 5 steps are left.
 
     uv run source/map_agent.py --local 7
@@ -35,13 +43,12 @@ import math
 from pathlib import Path
 
 import cli
-import cv2
 import frozen_map
 import mapping
 import navigator as navigator_module
 import numpy as np
 import planner as planner_module
-from geometry import Camera, FloorMask, epipolar_inliers, match_features, relative_pose, wall_view
+from geometry import Camera, FloorMask
 from goal import find_goal
 from localiser import Localiser
 from mapping import between, wrap
@@ -56,13 +63,21 @@ DEFAULT_TURN_DEG = 3.4375
 
 LOOKAHEAD_M = 0.15
 TURN_TOL_DEG = 12.0
+ARC_DEG = 45.0
 FORWARD_TICKS = 2
 MAX_TURN_TICKS = 3
+ARC_MAX_TURN_TICKS = 26
+"""Most ticks of a turn in place when arcs are on."""
+HOMING_TURN_TICKS = 3
+"""Most ticks of a turn in place while homing."""
+ARC_TOLERANCE = 0.2
+"""``arc_motion`` replaces the summed means with a measurement that differs by more than this."""
+ARCS = {"LEFT": "FORWARD|LEFT", "RIGHT": "FORWARD|RIGHT"}
 GUARD_M = 0.07
 GUARD_TICKS = 2
 NEAR_M = 0.15
 ALIGN_DEG = 8.0
-OFFSET_M = 0.08
+OFFSET_M = 0.05
 HOMING_MAX = 60
 VIEW_GATE_DEG = 30.0
 """Homing believes a goal view's yaw only within this of the estimate's."""
@@ -92,6 +107,29 @@ def load_motion(root: Path, routes, camera: Camera, floor: FloorMask) -> dict[st
     return motion
 
 
+def arc_motion(
+    motion: dict[str, dict], measured: dict[str, dict] | None = None
+) -> tuple[dict[str, dict], dict[str, float]]:
+    """The motion of the arcs (FORWARD with a turn, one tick), by action name: the FORWARD and
+    turn means summed. A ``measured`` arc (``{name: {"dx", "dy", "dyaw"}}``) replaces it where its
+    dx or dyaw is off the sum by more than ARC_TOLERANCE. Also each arc's worst relative
+    difference between the two (NaN without a measurement)."""
+    arcs, off = {}, {}
+    for turn, name in ARCS.items():
+        if "FORWARD" not in motion or turn not in motion:
+            continue
+        f, t = motion["FORWARD"], motion[turn]
+        summed = {k: f[k] + t[k] for k in ("dx", "dy", "dyaw")}
+        off[name] = math.nan
+        arcs[name] = summed
+        if measured and name in measured:
+            m = measured[name]
+            off[name] = max(abs(m[k] - summed[k]) / abs(summed[k]) for k in ("dx", "dyaw"))
+            if off[name] > ARC_TOLERANCE:
+                arcs[name] = {k: float(m[k]) for k in ("dx", "dy", "dyaw")}
+    return arcs, off
+
+
 class MapAgent(Agent):
     def __init__(
         self,
@@ -100,6 +138,12 @@ class MapAgent(Agent):
         goal_override: Pose | None = None,
         lookahead_m: float = LOOKAHEAD_M,
         turn_tol: float = TURN_TOL_DEG,
+        arc_deg: float = ARC_DEG,
+        arcs: bool = False,
+        max_turn_ticks: int | None = None,
+        shortcut: bool = False,
+        corridor_m: float = planner_module.CORRIDOR_M,
+        arc_measured: dict[str, dict] | None = None,
         forward_ticks: int = FORWARD_TICKS,
         guard_m: float = GUARD_M,
         near_m: float = NEAR_M,
@@ -107,10 +151,18 @@ class MapAgent(Agent):
         offset_m: float = OFFSET_M,
         homing_max: int = HOMING_MAX,
     ) -> None:
-        """``goal_override``: a goal pose in the map frame, used instead of ``find_goal``."""
+        """``goal_override``: a goal pose in the map frame, used instead of ``find_goal``.
+        ``arcs``: steer with arcs; ``max_turn_ticks`` is then ARC_MAX_TURN_TICKS unless given.
+        ``shortcut``: shortcut every plan, within ``corridor_m`` of the mapped frames.
+        ``arc_measured``: measured arc motion for ``arc_motion``."""
         self.root = Path(data_dir)
         self.goal_override = goal_override
         self.lookahead_m, self.turn_tol, self.forward_ticks = lookahead_m, turn_tol, forward_ticks
+        self.arc_deg, self.arcs = arc_deg, arcs
+        if max_turn_ticks is None:
+            max_turn_ticks = ARC_MAX_TURN_TICKS if arcs else MAX_TURN_TICKS
+        self.max_turn_ticks = max_turn_ticks
+        self.corridor_m = corridor_m if shortcut else None
         self.guard_m, self.near_m, self.align_deg = guard_m, near_m, align_deg
         self.offset_m, self.homing_max = offset_m, homing_max
 
@@ -128,6 +180,11 @@ class MapAgent(Agent):
         ]
         self.turn_rate = float(np.mean(turns)) if turns else DEFAULT_TURN_DEG
         """Degrees one LEFT or RIGHT tick turns, from the exploration data."""
+        arcs, self.arc_off = arc_motion(self.motion, arc_measured)
+        self.motion = {**self.motion, **arcs}
+        arc = arcs.get("FORWARD|LEFT")
+        self.arc_radius = math.inf if arc is None else abs(arc["dx"] / arc["dyaw"])
+        """Metres: the radius of the circle an arc drives."""
         self.reset()
 
     def reset(self) -> None:
@@ -149,8 +206,8 @@ class MapAgent(Agent):
         self.replan_pending = False
         self.guarded = False
         """The wall guard fired on this tick."""
-        self.view: tuple[int, float, float] | None = None
-        """Homing: the goal view the frame matched, the yaw to view 0 and the offset in metres."""
+        self.view: tuple[int, float] | None = None
+        """Homing: the goal view the frame matched and the yaw to view 0 it gave."""
         self.result: Result | None = None
 
     # -- the session
@@ -165,12 +222,15 @@ class MapAgent(Agent):
             self.goal = None if found is None else (found.x, found.y, found.yaw)
         self.found_goal = self.goal
         if self.goal is not None:
-            self.navigator = navigator_module.Navigator(self.planner, self.localiser, self.goal)
-        sift = cv2.SIFT_create()
-        self.goal_views = [wall_view(t, self.camera, self.floor, sift) for t in info.targets]
+            self.navigator = navigator_module.Navigator(
+                self.planner,
+                self.localiser,
+                self.goal,
+                store=self.store,
+                corridor_m=self.corridor_m,
+            )
         self.servo = Servo(self.camera.fx, cx=self.camera.cx, min_matches=SERVO_MIN_MATCHES)
         self.goal_features = [self.servo.features(t) for t in info.targets]
-        self.rng = np.random.default_rng(0)
 
     def finish(self, result: Result | None) -> None:
         self.result = result
@@ -198,14 +258,17 @@ class MapAgent(Agent):
 
     def _move(self, name: str, obs: Observation) -> tuple[Action, int]:
         """One tick of ``name``, unless the wall guard turns a FORWARD into a retreat."""
-        if name == "FORWARD" and self._centre_range() < self.guard_m:
+        if name.startswith("FORWARD") and self._centre_range() < self.guard_m:
             self.guard_events += 1
             self.guarded = True
             self.mode, self.replan_pending = "guard", True
             self.queue = ["BACKWARD"] * (GUARD_TICKS - 1)
             name = "BACKWARD"
         self.last = name
-        return getattr(Action, name), 1
+        action = Action(0)
+        for part in name.split("|"):
+            action |= getattr(Action, part)
+        return action, 1
 
     def _checkin(self, reason: str) -> tuple[Action, int]:
         self.checkin_reason, self.last, self.queue = reason, None, []
@@ -227,6 +290,7 @@ class MapAgent(Agent):
         gx, gy, _ = self.goal
         if not self.homing and math.hypot(estimate.x - gx, estimate.y - gy) <= self.near_m:
             self.homing = True
+            self.localiser.focus = (gx, gy)
         if self.homing:
             return "home", self._home(obs)
         path = self.update.path
@@ -236,16 +300,21 @@ class MapAgent(Agent):
         error = math.degrees(
             wrap(math.atan2(waypoint[1] - estimate.y, waypoint[0] - estimate.x) - estimate.yaw)
         )
-        return "nav", self._steer(error)
+        distance = math.hypot(waypoint[0] - estimate.x, waypoint[1] - estimate.y)
+        return "nav", self._steer(error, distance)
 
-    def _steer(self, error: float) -> list[str]:
-        """Turn toward a waypoint ``error`` degrees to the left, or drive at it."""
-        if abs(error) > self.turn_tol:
-            return self._turn(error)
-        return ["FORWARD"] * self.forward_ticks
+    def _steer(self, error: float, distance: float = math.inf) -> list[str]:
+        """Drive at a waypoint ``distance`` metres away and ``error`` degrees to the left, in an
+        arc or after turning."""
+        if abs(error) <= self.turn_tol:
+            return ["FORWARD"] * self.forward_ticks
+        reachable = distance >= 2 * self.arc_radius * math.sin(math.radians(abs(error)))
+        if self.arcs and abs(error) <= self.arc_deg and reachable:
+            return [ARCS["LEFT" if error > 0 else "RIGHT"]]
+        return self._turn(error, self.max_turn_ticks)
 
-    def _turn(self, error: float) -> list[str]:
-        ticks = int(np.clip(round(abs(error) / self.turn_rate), 1, MAX_TURN_TICKS))
+    def _turn(self, error: float, most: int = HOMING_TURN_TICKS) -> list[str]:
+        ticks = int(np.clip(round(abs(error) / self.turn_rate), 1, most))
         return ["LEFT" if error > 0 else "RIGHT"] * ticks
 
     def _home(self, obs: Observation) -> list[str]:
@@ -253,7 +322,8 @@ class MapAgent(Agent):
         if self.homing_steps > self.homing_max:
             self.checkin_reason = "homing_max"
             return ["CHECKIN"]
-        yaw, (x, y) = self._goal_error(obs.image)
+        yaw = self._yaw_to_view0(obs.image)
+        x, y = between(self.update.estimate[:3], self.goal)[:2]
         distance = math.hypot(x, y)
         if self.approaching:
             if distance > self.offset_m:
@@ -280,14 +350,12 @@ class MapAgent(Agent):
             return ["BACKWARD"]
         return self._turn(angle if abs(angle) < 90 else angle - math.copysign(180.0, angle))[:1]
 
-    def _goal_error(self, image: np.ndarray) -> tuple[float, tuple[float, float]]:
-        """``(degrees to turn left to face view 0, goal position in the robot frame)``. The
-        estimate gives both; the goal view the frame matches best (SIFT, servo.py) gives the yaw,
-        and the rigid relative pose to it the position, where they exist. A view is only
-        believed if its yaw is within VIEW_GATE_DEG of the estimate's: look-alikes match too."""
+    def _yaw_to_view0(self, image: np.ndarray) -> float:
+        """Degrees to turn left to face view 0. The estimate gives it; the goal view the frame
+        matches best (SIFT, servo.py) overrides it, if within VIEW_GATE_DEG of the estimate's:
+        look-alikes match too."""
         estimate = self.update.estimate
         error = math.degrees(wrap(self.goal[2] - estimate.yaw))
-        there = between(estimate[:3], self.goal)[:2]
         current = self.servo.features(image)
         best = None
         for k, features in enumerate(self.goal_features):
@@ -300,17 +368,9 @@ class MapAgent(Agent):
             if best is None or inliers > best[0]:
                 best = inliers, k, seen
         if best is None:
-            return error, there
-        _, k, error = best
-        view, goal_view = self.localiser.previous, self.goal_views[k]
-        matches = match_features(goal_view, view)
-        fit = relative_pose(
-            goal_view, view, matches[epipolar_inliers(goal_view, view, matches)], self.rng
-        )
-        if fit is not None:
-            there = between(fit[0], (0.0, 0.0, 0.0))[:2]
-        self.view = k, error, math.hypot(*there)
-        return error, there
+            return error
+        self.view = best[1], best[2]
+        return best[2]
 
     # -- the viewer
 
@@ -336,6 +396,16 @@ if __name__ == "__main__":
     parser.add_argument("--data", default=None, help="exploration data directory")
     parser.add_argument("--lookahead-m", type=float, default=LOOKAHEAD_M)
     parser.add_argument("--turn-tol", type=float, default=TURN_TOL_DEG, help="degrees")
+    parser.add_argument("--arc-deg", type=float, default=ARC_DEG, help="degrees")
+    parser.add_argument("--arcs", action="store_true", help="steer with FORWARD+turn arcs")
+    parser.add_argument(
+        "--max-turn-ticks",
+        type=int,
+        default=None,
+        help=f"{MAX_TURN_TICKS}; {ARC_MAX_TURN_TICKS} with --arcs",
+    )
+    parser.add_argument("--shortcut", action="store_true", help="string-pull every plan")
+    parser.add_argument("--corridor-m", type=float, default=planner_module.CORRIDOR_M)
     parser.add_argument("--forward-ticks", type=int, default=FORWARD_TICKS)
     parser.add_argument("--guard-m", type=float, default=GUARD_M)
     parser.add_argument("--near-m", type=float, default=NEAR_M)
@@ -348,6 +418,11 @@ if __name__ == "__main__":
         cli.exploration_data(args, args.data),
         lookahead_m=args.lookahead_m,
         turn_tol=args.turn_tol,
+        arc_deg=args.arc_deg,
+        arcs=args.arcs,
+        max_turn_ticks=args.max_turn_ticks,
+        shortcut=args.shortcut,
+        corridor_m=args.corridor_m,
         forward_ticks=args.forward_ticks,
         guard_m=args.guard_m,
         near_m=args.near_m,

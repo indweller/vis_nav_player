@@ -11,6 +11,7 @@ from typing import NamedTuple
 import numpy as np
 from localiser import Estimate, Localiser
 from planner import Path, PlaceGraph, Pose
+from scipy.spatial import cKDTree
 
 REPLAN_M = 0.15
 """Replan when the estimate is this far from the path."""
@@ -39,9 +40,15 @@ class Navigator:
         replan_m: float = REPLAN_M,
         replan_every: int = REPLAN_EVERY,
         jump_m: float = JUMP_M,
+        store=None,
+        corridor_m: float | None = None,
     ) -> None:
+        """With a ``store`` (the FrozenMap) and ``corridor_m``, every new path is shortcut
+        (``Path.shortcut``) before it is used."""
         self.planner, self.localiser, self.goal = planner, localiser, goal_pose
         self.replan_m, self.replan_every, self.jump_m = replan_m, replan_every, jump_m
+        self.store, self.corridor_m = store, corridor_m
+        self.tree = None if store is None or corridor_m is None else cKDTree(store.xy)
         self.path: Path | None = None
         self.since_plan = 0
 
@@ -68,6 +75,8 @@ class Navigator:
             if planned is None:
                 reason = None
             else:
+                if self.tree is not None:
+                    planned = planned.shortcut(self.store, self.corridor_m, self.tree)
                 self.path, self.since_plan = planned, 0
         waypoint = None
         if self.path is not None:

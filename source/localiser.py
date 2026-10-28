@@ -11,7 +11,8 @@ lie on those of the matched frame and of the FIX_NEIGHBOURS frames either side o
 their mapped poses (geometry.layout_score >= ``layout_min``): that drops look-alike places. A fix
 further from the estimate than max(GATE_M, 3 sigma) is not believed at once: it is held, and taken
 only if the next fix agrees with it (HOLD_AGREE_M, HOLD_AGREE_DEG), as a replacement of the
-estimate. With no accepted fix for ``lost_ticks`` ticks, or sigma over ``lost_sigma``, the robot
+estimate. With a ``focus`` set a fix is tried every tick, against the frames near the focus.
+With no accepted fix for ``lost_ticks`` ticks, or sigma over ``lost_sigma``, the robot
 is lost: the search covers every mapped frame, and every fix needs that confirmation.
 """
 
@@ -112,6 +113,9 @@ class Localiser:
         self.held: tuple[float, float, float, int] | None = None
         """The held fix's gap to the estimate (dx, dy, dyaw) and the tick it was made."""
         self.previous = None
+        self.focus: tuple[float, float] | None = None
+        """A map position: while set, a fix is tried every tick against the mapped frames within
+        FIX_RADIUS_M of it (rather than of the estimate)."""
 
     def step(self, frame: np.ndarray, action: str | None) -> Estimate:
         """Advance one tick: ``frame`` is the image after ``action`` (a name from
@@ -129,7 +133,7 @@ class Localiser:
         if self.lost and not self._was_lost:
             self.lost_events += 1
         self._was_lost = self.lost
-        if self.ticks % self.fix_every == 0:
+        if self.focus is not None or self.ticks % self.fix_every == 0:
             if self.held is not None and self.ticks - self.held[3] > HOLD_TICKS:
                 self.held, rejected = None, 1
             found = self._fix(view) if view.des is not None else None
@@ -190,7 +194,9 @@ class Localiser:
         """The absolute pose of ``view`` from the map and its layout score, or None: near the
         estimate, or over every frame when lost."""
         rows = np.arange(len(self.map.xy))
-        if not self.lost:
+        if self.focus is not None:
+            rows = rows[np.hypot(*(self.map.xy - self.focus).T) <= FIX_RADIUS_M]
+        elif not self.lost:
             radius = max(FIX_RADIUS_M, 3 * self.sigma)
             rows = rows[np.hypot(*(self.map.xy - self.pose[:2]).T) <= radius]
         if not len(rows):
