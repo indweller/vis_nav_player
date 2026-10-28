@@ -47,6 +47,7 @@ from eval_cues import Walls, stored_floor
 from eval_geometry import Frame, wall_cells, wall_distance
 from geometry import MAP_RES, OccupancyMap, rigid_fit, transform
 from scipy.ndimage import distance_transform_edt
+from scipy.spatial import cKDTree
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -88,6 +89,24 @@ def true_poses(root: Path, routes: list[mapping.Route]) -> list[np.ndarray]:
             raise RuntimeError(f"traj_{t}: {len(poses)} poses for {len(route.frames)} frames")
         out.append(poses)
     return out
+
+
+class MapTruth:
+    """The true pose of every mapped frame (the FrozenMap's rows) and what a perfect
+    localisation against this map would say."""
+
+    def __init__(self, store, truth: list[np.ndarray]) -> None:
+        self.store = store
+        self.poses = np.concatenate(truth)
+        self.tree = cKDTree(self.poses[:, :2])
+
+    def consistent(self, pose) -> tuple[float, float, float]:
+        """The true world ``pose`` in the map frame as the map has it: the mapped pose of the
+        frame nearest it, composed with the true relative pose from that frame to ``pose``."""
+        n = int(self.tree.query(pose[:2])[1])
+        return mapping.compose(
+            self.store.pose(n), mapping.between(tuple(self.poses[n]), tuple(pose))
+        )
 
 
 # -- metrics

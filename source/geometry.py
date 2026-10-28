@@ -19,6 +19,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from scipy.ndimage import distance_transform_edt
+from scipy.spatial import cKDTree
 
 CAMERA_HEIGHT = 0.20
 """Metres from the floor to the camera, measured from renders. The camera dict's height_offset
@@ -89,6 +90,12 @@ FIT_MIN_SEPARATION = 0.05
 """A rigid_ransac hypothesis is drawn from two pairs this far apart (metres) in both views."""
 FIT_MIN_INLIERS = 6
 """visual_odometry and relative_pose give nothing with fewer inliers."""
+LAYOUT_TOL_M = 0.05
+"""layout_score: a wall point agrees with the other scan's if one lies this close."""
+LAYOUT_RANGE_M = 1.2
+"""layout_score: only the points this near a scan's origin are judged."""
+LAYOUT_MIN = 0.6
+"""The layout score a fix or a goal needs to be believed."""
 
 
 class Camera:
@@ -404,6 +411,33 @@ def pose_score(
     """The likelihood field's mean over the robot-frame ``local`` placed at ``pose``."""
     local = local[np.isfinite(local).all(axis=1)]
     return float(field(transform(pose, local)).mean()) if len(local) else 0.0
+
+
+def layout_score(
+    points_a: np.ndarray,
+    points_b: np.ndarray,
+    pose_b_in_a: tuple[float, float, float],
+    tol: float = LAYOUT_TOL_M,
+) -> tuple[float, int]:
+    """How well two wall scans agree once b is placed at ``pose_b_in_a``: ``(agree, n)``. The
+    fraction of b's points within LAYOUT_RANGE_M of b's origin that lie within ``tol`` of one of
+    a's, and the fraction of a's points within LAYOUT_RANGE_M of b's origin within ``tol`` of one
+    of b's; ``agree`` is their mean (the one that exists when the other has no points) and ``n``
+    the number of points judged. NaN rows are ignored; ``(0.0, 0)`` without points."""
+    a = points_a[np.isfinite(points_a).all(axis=1)]
+    b = points_b[np.isfinite(points_b).all(axis=1)]
+    b_near = b[np.hypot(*b.T) <= LAYOUT_RANGE_M]
+    placed_all = transform(pose_b_in_a, b)
+    placed = transform(pose_b_in_a, b_near)
+    a_near = a[np.hypot(*(a - np.asarray(pose_b_in_a[:2])).T) <= LAYOUT_RANGE_M]
+    fractions, n = [], 0
+    for source, target in ((placed, a), (a_near, placed_all)):
+        if not len(source):
+            continue
+        n += len(source)
+        near = cKDTree(target).query(source)[0] <= tol if len(target) else np.zeros(len(source))
+        fractions.append(float(np.mean(near)))
+    return (float(np.mean(fractions)), n) if fractions else (0.0, 0)
 
 
 def clip_range(wall_points: np.ndarray, max_range: float) -> np.ndarray:

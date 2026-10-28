@@ -14,7 +14,8 @@ Course tutorial: <https://visual-navigation-challenge.ai4ce.dev/>
 | Place-recognition agent (`my_agent.py`) | Autonomous, but never reaches the goal in local evals. Control is the bottleneck. |
 | Pose-free metric map (`mapping.py`) | **Working, frozen.** Trajectories are within about 0.05–0.2 m of truth. The occupancy grid is noisy. |
 | Goal identification (`goal.py`) | **Working.** The right exploration frame is found, with an accurate relative pose. Map-frame error is dominated by mapping error. |
-| Map-based controller | Not started. |
+| Planning and localisation (`planner.py`, `localiser.py`, `navigator.py`) | **Built, evaluated with an oracle driver.** Online localisation on the frozen map and Dijkstra over a place graph. See `eval_planning.py`. |
+| Map-based agent (`map_agent.py`) | **Built, evaluated closed loop.** Path follower, wall guard and visual homing on the navigator. See `eval_closed_loop.py`. |
 
 The current direction: a metric map built from exploration data only (no poses), goal identification
 in that map, then a controller that tracks the robot from the known spawn pose and homes in visually
@@ -46,6 +47,10 @@ uv run pytest -q && uv run ruff check . && uv run ruff format --check .
 | `source/geometry.py` | Single-image geometry. A floor mask gives per-column wall ranges and wall points; Manhattan yaw (heading mod 90°); visual odometry (SIFT wall points + rigid RANSAC); occupancy map; scan matching; motion calibration. |
 | `source/mapping.py` | Pose-free map from exploration data: visual odometry + Manhattan snap → VLAD/SIFT loop closures → pose graph (robust least squares) → occupancy grid. No poses or simulator used. |
 | `source/frozen_map.py` | Caches a `mapping.build` result in `data/eval/<seed>/map_graph.npz` (every frame's pose, grid, VLAD) plus lazily filled SIFT sidecars. |
+| `source/planner.py` | `PlaceGraph` over every 5th mapped frame: route edges plus near-pair links kept only if they cross no occupied grid cell and share ≥ 15 SIFT inliers (cached in `links.npz`); metric + turn cost; Dijkstra `plan`; `Path.cross_track`. |
+| `source/localiser.py` | Online pose on the frozen map: visual odometry + Manhattan snap, VLAD/SIFT fixes blended by sigma. A fix beyond max(0.3 m, 3 sigma) is held until the next fix agrees (0.1 m / 5°); global search when lost uses the same confirmation. |
+| `source/navigator.py` | Localise, replan (no path, cross-track, fix jump, periodic), next waypoint. |
+| `source/map_agent.py` | `MapAgent`: frozen map + `PlaceGraph` + localiser + navigator; turns / drives toward a waypoint 0.15 m along the path, backs off a wall, homes in on the four goal views near the goal, and checks in. `uv run source/map_agent.py --local 7`. |
 | `source/goal.py` | `find_goal`: for each of the 4 views, VLAD top-20 → rerank by SIFT inliers → relative pose → goal pose and heading (−90°·k for view k). |
 | `source/baseline_agent.py`, `source/vlad.py` | Upstream baseline, unmodified. |
 | `source/cli.py` | Shared CLI and `.env` loading. Local exploration data is recorded every tick (`capture_every=1`). |
@@ -70,10 +75,13 @@ All of these run on the local simulator and use ground truth only for scoring.
 | `eval_tracking.py` | Offline poses, a metric place graph, and online tracking with SIFT fixes. |
 | `eval_map.py` | **Pose-free map vs truth:** trajectory error, wall precision/recall, closures. Writes plots to `results/eval/map/`. |
 | `eval_goal_map.py` | **Goal identification on the frozen map:** the real target + 40 random goals per maze; mazes 7–9 for development, 10–12 held out. Writes plots to `results/eval/goal/`. |
+| `eval_closed_loop.py` | **MapAgent closed loop** on mazes 7–12, goal found / true: per-tick log, localisation error, wall guards, stalls, mode fractions, the simulator's check-in and the SDK's local score. Writes plots, `runs.csv` and `ticks.csv` to `results/eval/closed_loop/`. |
+| `eval_planning.py` | **Planning and localisation with an oracle driver** (direct and detour) on mazes 7–12: localisation error, fixes, lost events, replans, plan quality. Writes plots and `planning.csv` to `results/eval/planning/`. |
 
 ```bash
 uv run source/eval/eval_map.py --mazes 7,8,9
 uv run source/eval/eval_goal_map.py --mazes 7,8,9,10,11,12   # --rebuild to rebuild frozen maps
+uv run source/eval/eval_planning.py                          # mazes 7-12, direct and detour
 ```
 
 Evaluation data goes to `data/eval/<seed>/`: `record()` output with the challenge's settings, 3 routes,

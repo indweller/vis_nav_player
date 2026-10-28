@@ -21,6 +21,17 @@ the chosen frame to the goal); the mapping error (the chosen frame's mapped pose
 true one); the relative pose's error (against the true pose of view k's camera in the frame's
 camera frame); the confidence.
 
+The goal error is also taken against the map-consistent truth (cm_): the true goal as the map
+has it, the mapped pose of the frame nearest the true goal composed with the true relative pose
+from that frame to the goal. Mapping error then is not counted against the goal.
+
+find_goal checks each of its top candidates by the layout of the goal's wall points against the
+map's (geometry.layout_score), and prefers a candidate passing --layout-min. Per sample: the
+chosen candidate's layout and view agreement (the views whose own best candidate is within 0.3 m
+of it), and the success the inliers-only choice (the top candidate by inliers) would have had;
+per maze, the layout scores of the true candidates (within 0.3 m of the map-consistent goal)
+against the false.
+
 Plots, in results/eval/goal/: <seed>_goals.png (the map with the true walls, a true goal arrow
 in green and an estimated one in red per sample, joined by a line) and <seed>_examples.png (six
 samples, two each of the best, median and worst by position error: target view k | the matched
@@ -40,18 +51,19 @@ import vis_nav_sim as sim
 from common import cell_centre, fmt, ints, textures, wrap, write_csv, yaw_error_deg
 from eval_cues import Walls, stored_floor
 from eval_geometry import Frame
-from eval_map import MAP_COLOUR, Canvas, record, true_poses
+from eval_map import MAP_COLOUR, Canvas, MapTruth, record, true_poses
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import frozen_map  # noqa: E402
 import goal  # noqa: E402
 import mapping  # noqa: E402
-from geometry import Camera  # noqa: E402
+from geometry import LAYOUT_MIN, Camera  # noqa: E402
 
 SUCCESS_M, SUCCESS_DEG = 0.2, 30.0
 LOOSE_M = 0.4
 YAWS = (0.0, 90.0, 180.0, 270.0)
+TRUE_CANDIDATE_M = 0.3
 SPLITS = {"7-9": (7, 8, 9), "10-12": (10, 11, 12)}
 CONFIDENCE_BINS = [(0, 5), (5, 10), (10, 20), (20, 40), (40, 10**9)]
 FIELDS = [
@@ -68,6 +80,13 @@ FIELDS = [
     "yaw_err_deg",
     "success_0.2",
     "success_0.4",
+    "cm_pos_err_m",
+    "cm_yaw_err_deg",
+    "cm_success_0.2",
+    "cm_success_0.4",
+    "inliers_only_cm_success_0.2",
+    "layout",
+    "view_agreement",
     "k",
     "inliers",
     "confidence",
@@ -113,9 +132,16 @@ def pose_error(est: tuple, true: tuple) -> tuple[float, float]:
 
 
 def score(
-    sample: dict, found: goal.Goal | None, store, frame: Frame, truth: list[np.ndarray]
+    sample: dict,
+    found: goal.Goal | None,
+    ranking: list[goal.Candidate],
+    store,
+    frame: Frame,
+    truth: list[np.ndarray],
+    consistent: MapTruth,
 ) -> dict:
     true = tuple(frame.to_map(np.array([sample["pose"]]))[0])
+    mapped_true = consistent.consistent(sample["pose"])
     row = {
         "real_target": int(sample["real"]),
         "true_x": true[0],
@@ -129,9 +155,16 @@ def score(
             "yaw_err_deg": 180.0,
             "success_0.2": 0,
             "success_0.4": 0,
+            "cm_pos_err_m": math.inf,
+            "cm_yaw_err_deg": 180.0,
+            "cm_success_0.2": 0,
+            "cm_success_0.4": 0,
+            "inliers_only_cm_success_0.2": 0,
         }
     est = (found.x, found.y, found.yaw)
     position, yaw = pose_error(est, true)
+    cm_position, cm_yaw = pose_error(est, mapped_true)
+    first = pose_error(ranking[0][3:6], mapped_true)
     route, index = int(store.route[found.frame]), int(store.frame[found.frame])
     true_frame = tuple(frame.to_map(truth[route][index : index + 1])[0])
     mapped = store.pose(found.frame)
@@ -145,6 +178,15 @@ def score(
             "success_0.2": int(position <= SUCCESS_M and yaw <= SUCCESS_DEG),
             "success_0.4": int(position <= LOOSE_M and yaw <= SUCCESS_DEG),
         },
+        cm_pos_err_m=cm_position,
+        cm_yaw_err_deg=cm_yaw,
+        **{
+            "cm_success_0.2": int(cm_position <= SUCCESS_M and cm_yaw <= SUCCESS_DEG),
+            "cm_success_0.4": int(cm_position <= LOOSE_M and cm_yaw <= SUCCESS_DEG),
+            "inliers_only_cm_success_0.2": int(first[0] <= SUCCESS_M and first[1] <= SUCCESS_DEG),
+        },
+        layout=found.layout,
+        view_agreement=found.view_agreement,
         k=found.k,
         inliers=found.inliers,
         confidence=found.confidence,
@@ -249,17 +291,30 @@ def evaluate(seed: int, args, floor, out: Path) -> tuple[list[dict], list[tuple[
     store, routes = frozen_map.get(root, world.camera, floor, rebuild=args.rebuild)
     truth = true_poses(root, routes)
     frame = Frame((0.0, 0.0, 0.0), tuple(truth[0][0]))
+    consistent = MapTruth(store, truth)
     camera = Camera({**world.camera, "cy": world.camera["cy"] + mapping.HORIZON_SHIFT_PX})
 
     rng = np.random.default_rng(seed)
     results = []
     for number, sample in enumerate(samples(world, args.n, rng)):
-        found = goal.find_goal(sample["views"], store, camera, floor)
-        row = {"seed": seed, "sample": number, **score(sample, found, store, frame, truth)}
+        ranking: list[goal.Candidate] = []
+        found = goal.find_goal(
+            sample["views"], store, camera, floor, ranking, layout_min=args.layout_min
+        )
+        row = {
+            "seed": seed,
+            "sample": number,
+            **score(sample, found, ranking, store, frame, truth, consistent),
+        }
+        mapped_true = consistent.consistent(sample["pose"])
+        sample["candidates"] = [
+            (c.layout, math.dist(c[3:5], mapped_true[:2]) <= TRUE_CANDIDATE_M) for c in ranking
+        ]
         results.append((sample, row))
         print(
             f"  {number:>3} {'T' if sample['real'] else ' '} pos {fmt(row['pos_err_m'], 2):>5} m "
-            f"yaw {fmt(row['yaw_err_deg'], 0):>4} deg  conf {row.get('confidence', '-')}",
+            f"yaw {fmt(row['yaw_err_deg'], 0):>4} deg  conf {row.get('confidence', '-')}  "
+            f"layout {fmt(row.get('layout'), 2)} views {row.get('view_agreement', '-')}",
             flush=True,
         )
     store.sift.flush()
@@ -284,16 +339,39 @@ def summarise(label: str, rows: list[dict]) -> None:
     print(
         f"{label:<8} {n:>4} | {sum(r['success_0.2'] for r in rows) / n:>8.2f} "
         f"{sum(r['success_0.4'] for r in rows) / n:>8.2f} | "
-        f"{median(rows, 'pos_err_m'):>7} {median(rows, 'yaw_err_deg'):>7} | "
+        f"{sum(r['cm_success_0.2'] for r in rows) / n:>7.2f} "
+        f"{sum(r['inliers_only_cm_success_0.2'] for r in rows) / n:>8.2f} "
+        f"{sum(r['cm_success_0.4'] for r in rows) / n:>7.2f} | "
+        f"{median(rows, 'pos_err_m'):>7} {median(rows, 'cm_pos_err_m'):>7} "
+        f"{median(rows, 'yaw_err_deg'):>7} | "
         f"{median(rows, 'retrieval_err_m'):>7} {median(rows, 'mapping_err_m'):>7} "
-        f"{median(rows, 'rel_pos_err_m'):>7}"
+        f"{median(rows, 'rel_pos_err_m'):>7} | "
+        f"{median(rows, 'layout'):>6} {median(rows, 'view_agreement'):>5}"
     )
 
 
-def report(rows: list[dict]) -> None:
+def candidate_layouts(results: list[tuple[dict, dict]], name: str) -> None:
+    """The layout scores of the true candidates (within TRUE_CANDIDATE_M of the map-consistent
+    goal) against the false, pooled over ``results``."""
+    pooled = [c for sample, _ in results for c in sample.get("candidates", [])]
+    for label, want in (("true", True), ("false", False)):
+        scores = np.array([layout for layout, true in pooled if true is want], float)
+        if not len(scores):
+            print(f"  {name:<8} {label:<5} candidates: none")
+            continue
+        q = np.percentile(scores, [10, 50, 90])
+        print(
+            f"  {name:<8} {label:<5} candidates {len(scores):>5}: layout p10 {q[0]:.2f} "
+            f"median {q[1]:.2f} p90 {q[2]:.2f}, {np.mean(scores >= goal.LAYOUT_MIN):.2f} "
+            f">= {goal.LAYOUT_MIN}"
+        )
+
+
+def report(rows: list[dict], results: list[tuple[dict, dict]]) -> None:
     head = (
-        f"{'':<8} {'n':>4} | {'ok 0.2m':>8} {'ok 0.4m':>8} | {'pos m':>7} {'yaw deg':>7} | "
-        f"{'retr m':>7} {'map m':>7} {'rel m':>7}   (medians)"
+        f"{'':<8} {'n':>4} | {'ok 0.2m':>8} {'ok 0.4m':>8} | {'cm 0.2':>7} {'inl-only':>8} "
+        f"{'cm 0.4':>7} | {'pos m':>7} {'cm pos':>7} {'yaw deg':>7} | {'retr m':>7} "
+        f"{'map m':>7} {'rel m':>7} | {'layout':>6} {'views':>5}   (medians)"
     )
     print("\n" + head + "\n" + "-" * len(head))
     for seed in sorted({r["seed"] for r in rows}):
@@ -301,6 +379,20 @@ def report(rows: list[dict]) -> None:
     for name, seeds in SPLITS.items():
         summarise(name, [r for r in rows if r["seed"] in seeds])
     summarise("all", rows)
+    print(
+        "\nlayout of find_goal's candidates, true (<= 0.3 m from the map-consistent goal) or false:"
+    )
+    for seed in sorted({r["seed"] for r in rows}):
+        candidate_layouts([sr for sr in results if sr[1]["seed"] == seed], f"maze {seed}")
+    candidate_layouts(results, "all")
+    real = [r for r in rows if r["real_target"]]
+    print("\nthe real targets:")
+    for r in real:
+        print(
+            f"  maze {r['seed']}: layout {fmt(r.get('layout'), 2)} "
+            f"views {r.get('view_agreement', '-')} "
+            f"error {fmt(r['pos_err_m'], 2)} m (map-consistent {fmt(r['cm_pos_err_m'], 2)} m)"
+        )
     for name, seeds in SPLITS.items():
         pooled = [r for r in rows if r["seed"] in seeds and "confidence" in r]
         if not pooled:
@@ -320,6 +412,7 @@ def main() -> None:
     )
     p.add_argument("--mazes", default="7,8,9,10,11,12", help="comma-separated maze seeds")
     p.add_argument("--n", type=int, default=40, help="random goals per maze")
+    p.add_argument("--layout-min", type=float, default=LAYOUT_MIN, help="layout score to pass")
     p.add_argument("--rebuild", action="store_true", help="rebuild the frozen maps")
     p.add_argument("--out-dir", default="results/eval", help="where goal/ goes")
     args = p.parse_args()
@@ -327,11 +420,13 @@ def main() -> None:
     out = Path(args.out_dir) / "goal"
     floor = stored_floor()
     rows: list[dict] = []
+    results: list[tuple[dict, dict]] = []
     for seed in ints(args.mazes):
-        maze, _ = evaluate(seed, args, floor, out)
+        maze, maze_results = evaluate(seed, args, floor, out)
         rows.extend(maze)
+        results.extend(maze_results)
     write_csv(out / "goals.csv", FIELDS, rows)
-    report(rows)
+    report(rows, results)
 
 
 if __name__ == "__main__":

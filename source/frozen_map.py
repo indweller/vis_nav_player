@@ -9,7 +9,8 @@ without rebuilding the map: ``data/eval/<seed>/map_graph.npz`` holds
 - the VLAD codebook and the VLAD vector of every frame (float16);
 
 and ``sift_r<route>.npz`` beside it, a lazily filled sidecar store of per-frame SIFT: RootSIFT
-descriptors (float16), keypoints and wall points. mapping.py's logic is untouched.
+descriptors (float16), keypoints and wall points; and ``points_r<route>.npz``, likewise filled,
+of the wall points of every image column (for layout checks). mapping.py's logic is untouched.
 """
 
 from __future__ import annotations
@@ -23,10 +24,13 @@ from pathlib import Path
 import cv2
 import mapping
 import numpy as np
-from geometry import Camera, FloorMask, OccupancyMap, WallView, wall_view
+from geometry import Camera, FloorMask, OccupancyMap, WallView, ranges, transform, wall_view
+from geometry import points as column_points
 from tqdm import tqdm
 
 MAP_NAME = "map_graph.npz"
+COLUMN_RANGE_M = 2.5
+"""Column wall points further than this are not kept."""
 
 
 def vlad(des: np.ndarray | None, centers: np.ndarray) -> np.ndarray:
@@ -63,17 +67,32 @@ class SiftStore:
         self.directory = Path(directory)
         self.cache: dict[tuple[int, int], tuple[np.ndarray, np.ndarray | None, np.ndarray]] = {}
         self.dirty = False
+        self.columns: dict[tuple[int, int], np.ndarray] = {}
+        self.columns_dirty = False
         self._local = threading.local()
         for r in range(len(routes)):
             path = self._path(r)
             if not path.exists():
                 continue
             with np.load(path) as data:
-                edges = np.concatenate([[0], np.cumsum(data["counts"])])
-                for i, frame in enumerate(data["frames"]):
-                    a, b = edges[i], edges[i + 1]
-                    des = data["des"][a:b] if b > a else None
-                    self.cache[(r, int(frame))] = (data["pixels"][a:b], des, data["wall"][a:b])
+                # Each data[...] reads the array from the file, so once, not per frame.
+                frames, counts = data["frames"], data["counts"]
+                pixels, all_des, wall = data["pixels"], data["des"], data["wall"]
+            edges = np.concatenate([[0], np.cumsum(counts)])
+            for i, frame in enumerate(frames):
+                a, b = edges[i], edges[i + 1]
+                des = all_des[a:b] if b > a else None
+                self.cache[(r, int(frame))] = (pixels[a:b], des, wall[a:b])
+            path = self._points_path(r)
+            if path.exists():
+                with np.load(path) as data:
+                    frames, counts, xy = data["frames"], data["counts"], data["points"]
+                edges = np.concatenate([[0], np.cumsum(counts)])
+                for i, frame in enumerate(frames):
+                    self.columns[(r, int(frame))] = xy[edges[i] : edges[i + 1]]
+
+    def _points_path(self, route: int) -> Path:
+        return self.directory / f"points_r{route}.npz"
 
     def _path(self, route: int) -> Path:
         return self.directory / f"sift_r{route}.npz"
@@ -103,7 +122,21 @@ class SiftStore:
             np.empty((0, 2)),
         )
 
+    def points(self, route: int, frame: int) -> np.ndarray:
+        """``(n, 2)`` robot-frame wall points of the frame's image columns within
+        COLUMN_RANGE_M (none NaN), float32."""
+        entry = self.columns.get((route, frame))
+        if entry is None:
+            image = self.routes[route].frames[frame]
+            xy = column_points(ranges(image, self.camera, self.floor))
+            keep = np.isfinite(xy).all(axis=1)
+            keep[keep] = np.hypot(*xy[keep].T) <= COLUMN_RANGE_M
+            entry = self.columns[(route, frame)] = xy[keep].astype(np.float32)
+            self.columns_dirty = True
+        return entry
+
     def flush(self) -> None:
+        self._flush_points()
         if not self.dirty:
             return
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -122,6 +155,23 @@ class SiftStore:
                 wall=np.concatenate([e[2] for e in entries]),
             )
         self.dirty = False
+
+    def _flush_points(self) -> None:
+        if not self.columns_dirty:
+            return
+        self.directory.mkdir(parents=True, exist_ok=True)
+        for r in range(len(self.routes)):
+            keys = sorted(k for k in self.columns if k[0] == r)
+            if not keys:
+                continue
+            entries = [self.columns[k] for k in keys]
+            np.savez(
+                self._points_path(r),
+                frames=np.array([k[1] for k in keys]),
+                counts=np.array([len(e) for e in entries]),
+                points=np.concatenate(entries),
+            )
+        self.columns_dirty = False
 
 
 class FrozenMap:
@@ -151,6 +201,23 @@ class FrozenMap:
 
     def view(self, n: int) -> WallView:
         return self.sift.view(int(self.route[n]), int(self.frame[n]))
+
+    def neighbours(self, n: int, k: int) -> np.ndarray:
+        """Rows of the frames within ``k`` of row ``n`` on its route (``n`` included)."""
+        before = int(self.frame[n])
+        after = len(self.poses[self.route[n]]) - 1 - before
+        return np.arange(n - min(k, before), n + min(k, after) + 1)
+
+    def surroundings(self, rows, origin: tuple[float, float, float] | None = None) -> np.ndarray:
+        """The wall points of the frames ``rows`` merged, each placed at its mapped pose: in the
+        map frame, or in the frame of ``origin`` (a map-frame pose)."""
+        out = []
+        for n in rows:
+            pose = self.pose(int(n))
+            if origin is not None:
+                pose = mapping.between(origin, pose)
+            out.append(transform(pose, self.sift.points(int(self.route[n]), int(self.frame[n]))))
+        return np.concatenate(out) if out else np.empty((0, 2))
 
     def image(self, n: int) -> np.ndarray:
         return self.sift.routes[self.route[n]].frames[int(self.frame[n])]
@@ -229,7 +296,7 @@ def get(
     routes = mapping.load_routes(root)
     path = root / MAP_NAME
     if rebuild or not path.exists():
-        for sidecar in root.glob("sift_r*.npz"):
+        for sidecar in [*root.glob("sift_r*.npz"), *root.glob("points_r*.npz")]:
             sidecar.unlink()
         freeze(root, routes, camera_dict, floor, path)
     return load(path, routes, floor), routes
