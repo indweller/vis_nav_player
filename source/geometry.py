@@ -18,6 +18,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from paths import ROOT
 from scipy.ndimage import distance_transform_edt
 from scipy.spatial import cKDTree
 
@@ -30,7 +31,7 @@ FAR = 5.0
 """The renderer's far plane: ranges are capped at it."""
 LUT_BINS = 16
 """Floor mask: per-channel bins of the colour lookup table."""
-FLOOR_MASK_PATH = Path("data") / "floor_mask.npz"
+FLOOR_MASK_PATH = ROOT / "data" / "floor_mask.npz"
 """FloorMask.load's default: fitted on mazes 1-6 (eval_cues.stored_floor)."""
 SEGMENT_SPAN = 16
 """manhattan_yaw: a segment joins columns this far apart. Neighbouring columns (1) see mostly the
@@ -83,6 +84,8 @@ KEYPOINT_MARGIN_PX = 1.0
 ends above the wall's foot in its column."""
 MATCH_RATIO = 0.8
 """match_features: Lowe's ratio."""
+EPIPOLAR_PX = 2.0
+"""epipolar_inliers: RANSAC's distance, pixels, from a point to its epipolar line."""
 FIT_RANGE = 1.2
 """rigid_ransac fits wall keypoints within this range, metres."""
 FIT_INLIER_M = 0.06
@@ -651,7 +654,7 @@ def match_features(a: WallView, b: WallView, ratio: float = MATCH_RATIO) -> np.n
 
 
 def epipolar_inliers(
-    a: WallView, b: WallView, matches: np.ndarray, threshold: float = 2.0
+    a: WallView, b: WallView, matches: np.ndarray, threshold: float = EPIPOLAR_PX
 ) -> np.ndarray:
     """Boolean mask over ``matches`` consistent with one fundamental matrix (RANSAC)."""
     if len(matches) < 8:

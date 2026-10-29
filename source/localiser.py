@@ -230,9 +230,7 @@ class Localiser:
         x, y, yaw = compose(self.pose, step)
         manhattan, confidence = manhattan_yaw(view.points)
         if confidence >= MANHATTAN_CONFIDENCE:
-            snapped = snap(yaw, manhattan)
-            if abs(wrap(snapped - yaw)) <= math.radians(mapping.SNAP_DEG):
-                yaw = snapped
+            yaw = snap(yaw, manhattan)
         self.pose = (x, y, yaw)
         self.sigma += DRIFT_M
 

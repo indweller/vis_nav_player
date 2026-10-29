@@ -6,9 +6,8 @@ import argparse
 import os
 from pathlib import Path
 
+from paths import ROOT
 from vis_nav_sdk import Client, SimError
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_dotenv(path: Path = ROOT / ".env") -> None:
@@ -100,7 +99,7 @@ def exploration_data(args: argparse.Namespace, data_dir: str | None) -> Path:
     return path
 
 
-def record_exploration_data(seed: int, dest: str | Path = "data") -> Path:
+def record_exploration_data(seed: int, dest: str | Path = ROOT / "data") -> Path:
     """``data/local-<seed>/``: what a challenge on this maze would hand out -- three drives
     through it, a frame every tick, ``target.jpg`` -- recorded here the first time."""
     path = Path(dest) / f"local-{seed}"

@@ -3,9 +3,10 @@ Map-based agent: follows a path on the frozen map to the goal, then homes in on 
 
 At construction it builds (or loads) the frozen map of the exploration data (``map_graph.npz``
 and the planner's ``links.npz`` cached in the data directory, the motion calibration in
-``motion.json``). At setup the goal is ``goal.find_goal`` on the four target views (or the
-``goal_override`` pose, for evaluations), the localiser starts at the map's origin (the spawn),
-and a navigator plans to the goal.
+``motion.json``). Each cache keeps a fingerprint of the settings it was made with and warns when
+stale (caches.py); --rebuild makes all three again. At setup the goal is ``goal.find_goal`` on
+the four target views (or the ``goal_override`` pose, for evaluations), the localiser starts at
+the map's origin (the spawn), and a navigator plans to the goal.
 
 Each tick the navigator localises (given the move just made), replans if it must, and the agent
 aims at the point --lookahead-m ahead on the path. Moves are held as queues of single ticks, so
@@ -59,6 +60,7 @@ import math
 import time
 from pathlib import Path
 
+import caches
 import cli
 import cv2
 import frozen_map
@@ -74,8 +76,9 @@ from mapping import between, wrap
 from servo import Servo
 from vis_nav_sdk import Action, Agent, Observation, Result, SessionInfo, run
 
-FLOOR_MASK_PATH = cli.ROOT / "data" / "floor_mask.npz"
+FLOOR_MASK_PATH = geometry.FLOOR_MASK_PATH
 MOTION_NAME = "motion.json"
+LINKS_NAME = "links.npz"
 DEFAULT_TURN_DEG = 3.4375
 
 LOOKAHEAD_M = 0.15
@@ -122,12 +125,17 @@ Pose = tuple[float, float, float]
 
 
 def load_motion(root: Path, routes, camera: Camera, floor: FloorMask) -> dict[str, dict]:
-    """mapping.calibrate over the exploration routes, kept in ``root/motion.json``."""
+    """mapping.calibrate over the exploration routes, kept in ``root/motion.json`` beside a
+    "fingerprint" key (caches.MOTION), which is checked on loading and not returned."""
     path = root / MOTION_NAME
+    expected = caches.fingerprint(caches.MOTION, floor)
     if path.exists():
-        return json.loads(path.read_text())
+        motion = json.loads(path.read_text())
+        caches.check(path, motion.pop("fingerprint", None), expected)
+        return motion
     motion = mapping.calibrate(routes, camera, floor)
-    path.write_text(json.dumps(motion, default=lambda v: np.asarray(v).tolist()))
+    saved = {**motion, "fingerprint": expected}
+    path.write_text(json.dumps(saved, default=lambda v: np.asarray(v).tolist()))
     return motion
 
 
@@ -183,6 +191,7 @@ class MapAgent(Agent):
         blocked_zero: bool = False,
         blocked_diff: float = BLOCKED_DIFF,
         online_motion: bool = True,
+        rebuild: bool = False,
     ) -> None:
         """``goal_override``: a goal pose in the map frame, used instead of ``find_goal``.
         ``arcs``: steer with arcs; ``max_turn_ticks`` is then ARC_MAX_TURN_TICKS unless given.
@@ -193,13 +202,17 @@ class MapAgent(Agent):
         alignment, the 15 inlier view gate, the turn after a homing timeout).
         ``align_source``: "estimate" (the default) turns by the estimate's yaw error only (the
         view is still matched and logged); "view" turns by the goal view's yaw when one matches.
+        In "estimate" mode the goal views are still matched every homing tick, and a match
+        changes one thing: the alignment tolerance widens from ESTIMATE_ALIGN_DEG (5 degrees) to
+        ``align_deg`` (8).
         ``goal_camera``: the camera the goal photos are read with: "frame" (the exploration
         frames' own camera), "photo" (the lower goal.TARGET_CAMERA_HEIGHT camera, which
         targets() renders with), or "auto": "photo", on local and server challenges alike.
         ``online_motion``: the fallback motion and turn rate from the run's own visual odometry
         (on by default; see the module docstring).
         ``floor_guard``, ``blocked_zero``: the options of the module docstring, each off by
-        default; ``floor_guard_frac`` and ``blocked_diff`` are their thresholds."""
+        default; ``floor_guard_frac`` and ``blocked_diff`` are their thresholds.
+        ``rebuild``: make the three caches (map, motion, links) again rather than load them."""
         if goal_camera not in GOAL_CAMERAS:
             raise ValueError(f"goal_camera must be one of {GOAL_CAMERAS}, not {goal_camera!r}")
         self.goal_camera = goal_camera
@@ -231,15 +244,20 @@ class MapAgent(Agent):
         )
         self.timings: dict[str, float] = {}
         """Seconds of each construction stage: map, motion, planner."""
+        if rebuild:
+            for name in (MOTION_NAME, LINKS_NAME):
+                (self.root / name).unlink(missing_ok=True)
         t = time.perf_counter()
-        self.store, self.routes = frozen_map.get(self.root, self.camera_dict, self.floor)
+        self.store, self.routes = frozen_map.get(
+            self.root, self.camera_dict, self.floor, rebuild=rebuild
+        )
         self.timings["map load/build"] = time.perf_counter() - t
         t = time.perf_counter()
         self.motion = load_motion(self.root, self.routes, self.camera, self.floor)
         self.timings["motion calibration"] = time.perf_counter() - t
         t = time.perf_counter()
         self.planner = planner_module.PlaceGraph(
-            self.store, link_m=link_m, cache_path=self.root / "links.npz"
+            self.store, link_m=link_m, cache_path=self.root / LINKS_NAME
         )
         self.timings["planner"] = time.perf_counter() - t
         turns = [
@@ -334,6 +352,7 @@ class MapAgent(Agent):
                 self.planner,
                 self.localiser,
                 self.goal,
+                lookahead_m=self.lookahead_m,
                 store=self.store,
                 corridor_m=self.corridor_m,
             )
@@ -420,10 +439,9 @@ class MapAgent(Agent):
             self.localiser.focus = (gx, gy)
         if self.homing:
             return "home", self._home(obs)
-        path = self.update.path
-        if path is None:
+        waypoint = self.update.waypoint
+        if waypoint is None:
             return "search", ["LEFT"]
-        waypoint = path.waypoint_after(path.cross_track(estimate[:3])[1], self.lookahead_m)
         error = math.degrees(
             wrap(math.atan2(waypoint[1] - estimate.y, waypoint[0] - estimate.x) - estimate.yaw)
         )
@@ -605,6 +623,7 @@ def agent_options(args) -> dict:
         "blocked_zero": args.blocked_zero,
         "blocked_diff": args.blocked_diff,
         "online_motion": not args.no_online_motion,
+        "rebuild": args.rebuild,
     }
 
 
@@ -616,6 +635,11 @@ def main(argv: list[str] | None = None) -> None:
         help="build or load everything offline, print timings, and exit before any server call",
     )
     parser.add_argument("--data", default=None, help="exploration data directory")
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="make the map, motion and links caches again (they warn when stale)",
+    )
     parser.add_argument("--lookahead-m", type=float, default=LOOKAHEAD_M)
     parser.add_argument("--turn-tol", type=float, default=TURN_TOL_DEG, help="degrees")
     parser.add_argument("--arc-deg", type=float, default=ARC_DEG, help="degrees")

@@ -133,7 +133,10 @@ def find_goal(
         if view.des is None:
             continue
         similarity = store.vlad @ vlad(view.des, store.centers)
-        top = np.argpartition(-similarity, TOP_K)[:TOP_K]
+        if len(similarity) > TOP_K:
+            top = np.argpartition(-similarity, TOP_K)[:TOP_K]
+        else:  # a map of TOP_K frames or fewer: all of them
+            top = np.arange(len(similarity))
         for n in top:
             mapped = store.view(int(n))
             matches = match_features(mapped, view)

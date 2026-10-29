@@ -1190,7 +1190,9 @@ def main() -> None:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--seed", type=int, default=101, help="the maze (outside 1-12)")
+    p.add_argument(
+        "--seed", type=int, default=101, help="the maze (10: the midterm-like regression maze)"
+    )
     p.add_argument("--maze-size", type=int, default=ROWS, help="maze rows and columns (cells)")
     p.add_argument("--routes", type=int, default=ROUTES, help="exploration routes recorded")
     p.add_argument(

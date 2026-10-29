@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from multiprocessing.pool import ThreadPool
 from pathlib import Path as FilePath
 
+import caches
 import numpy as np
 from geometry import epipolar_inliers, match_features
 from scipy.sparse import csr_matrix
@@ -234,14 +235,19 @@ class PlaceGraph:
 
     def _inliers(self, frozen_map, links: np.ndarray, cache_path: FilePath | None) -> np.ndarray:
         """SIFT epipolar inliers between the two frames of each link, from the cache or
-        computed (and cached)."""
+        computed (and cached). The cache keeps the fingerprint (caches.LINKS) it was made with: a
+        stale cache is used, warned about, and keeps its fingerprint when entries are added."""
         cache: dict[tuple[int, int], int] = {}
+        expected = caches.fingerprint(caches.LINKS)
+        stamp: str | None = expected
         if cache_path is not None and FilePath(cache_path).exists():
             with np.load(cache_path) as data:
                 cache = {
                     (int(a), int(b)): int(n)
                     for (a, b), n in zip(data["pairs"], data["inliers"], strict=True)
                 }
+                stamp = str(data["fingerprint"]) if "fingerprint" in data.files else None
+            caches.check(cache_path, stamp, expected)
         rows = self.row
         keys = [(int(rows[a]), int(rows[b])) for a, b in links]
         todo = [k for k in keys if k not in cache]
@@ -259,6 +265,7 @@ class PlaceGraph:
                     cache_path,
                     pairs=np.array(list(cache), int).reshape(-1, 2),
                     inliers=np.array(list(cache.values()), int),
+                    **({} if stamp is None else {"fingerprint": stamp}),
                 )
         return np.array([cache[k] for k in keys], int)
 

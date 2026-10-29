@@ -73,7 +73,6 @@ from mapping import (  # noqa: E402
     PRE_GATE_M,
     QUERY_EVERY,
     ROUNDS,
-    SNAP_DEG,
     TOP_K,
     between,
     compose,
@@ -123,10 +122,8 @@ def trace_odometry(route, start, camera, floor, motion, label: str) -> dict:
             used[i] = step
             pose = compose(pose, step)
             if confidence >= MANHATTAN_CONFIDENCE:
-                yaw = snap(pose[2], yaw_m)
-                if abs(wrap(yaw - pose[2])) <= math.radians(SNAP_DEG):
-                    pose = (pose[0], pose[1], yaw)
-                    snapped[i] = True
+                pose = (pose[0], pose[1], snap(pose[2], yaw_m))
+                snapped[i] = True
         poses[i] = pose
         if i % NODE_EVERY == 0:
             views.append(mapping.Node(view, clip_range(view.points, GRID_MAX_RANGE)))
@@ -221,9 +218,7 @@ def build_cache(seed: int, path: Path) -> dict:
             yaw = 0.0 if found is None else found
             yaw_m, confidence = manhattan_yaw(first.points)
             if confidence >= MANHATTAN_CONFIDENCE:
-                snapped = snap(yaw, yaw_m)
-                if abs(wrap(snapped - yaw)) <= math.radians(SNAP_DEG):
-                    yaw = snapped
+                yaw = snap(yaw, yaw_m)
         starts.append((0.0, 0.0, yaw))
         tracked.append(trace_odometry(route, starts[-1], camera, floor, motion, f"route {r}"))
     candidates, closures = trace_closures(tracked)

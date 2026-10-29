@@ -7,6 +7,7 @@ without rebuilding the map: ``data/eval/<seed>/map_graph.npz`` holds
   onto that node's pose;
 - the occupancy grid;
 - the VLAD codebook and the VLAD vector of every frame (float16);
+- the fingerprint of the settings it was built with (caches.MAP), checked on loading;
 
 and ``sift_r<route>.npz`` beside it, a lazily filled sidecar store of per-frame SIFT: RootSIFT
 descriptors (float16), keypoints and wall points; and ``points_r<route>.npz``, likewise filled,
@@ -21,6 +22,7 @@ from collections.abc import Sequence
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
 
+import caches
 import cv2
 import mapping
 import numpy as np
@@ -268,6 +270,7 @@ def freeze(
         centers=centers,
         vlad=vlads,
         camera=np.array([camera_dict[k] for k in CAMERA_KEYS]),
+        fingerprint=caches.fingerprint(caches.MAP, floor),
     )
     store.flush()
 
@@ -284,6 +287,8 @@ def load(path: Path, routes: list[mapping.Route], floor: FloorMask) -> FrozenMap
         camera_dict = dict(zip(CAMERA_KEYS, data["camera"].tolist(), strict=True))
         camera_dict.update(width=int(camera_dict["width"]), height=int(camera_dict["height"]))
         centers, vlads = data["centers"], data["vlad"].astype(np.float32)
+        saved = str(data["fingerprint"]) if "fingerprint" in data.files else None
+    caches.check(path, saved, caches.fingerprint(caches.MAP, floor))
     camera = Camera({**camera_dict, "cy": camera_dict["cy"] + mapping.HORIZON_SHIFT_PX})
     return FrozenMap(poses, grid, centers, vlads, SiftStore(routes, camera, floor, path.parent))
 

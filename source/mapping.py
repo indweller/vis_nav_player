@@ -5,7 +5,7 @@ No true poses, no simulator.
 1. Odometry. Per tick, geometry.visual_odometry between consecutive frames (SIFT matches on
    the walls, ranged by the floor-wall boundary, a RANSAC rigid fit). Where it fails, or gives
    more than MAX_STEP_M / MAX_STEP_DEG, the action's calibrate_motion mean stands in. The
-   integrated yaw is snapped to manhattan_yaw when that is confident and within SNAP_DEG of it.
+   integrated yaw is snapped to manhattan_yaw (the nearest axis-aligned yaw) when that is confident.
    Every route starts at the spawn, (0, 0, 0) for route 0; the others take route 0's position
    and the yaw of the SIFT match of their first frame to route 0's first START_FRAMES. The
    spawn's heading is taken to lie along a maze axis.
@@ -52,6 +52,7 @@ from geometry import (
     wall_view,
 )
 from my_agent import Float32VLAD
+from paths import ROOT
 from scipy.optimize import least_squares
 from scipy.sparse import coo_matrix, csr_matrix
 from servo import Servo
@@ -76,12 +77,11 @@ ROUNDS = 3
 GRID_MAX_RANGE = 0.8
 """Wall points beyond this range, metres, are left out of the map: a row of the wall's foot is
 ~0.05 m of range at 0.8 m, ~0.12 m at 1.5 m."""
-SNAP_DEG = 45.0
 MAX_STEP_M, MAX_STEP_DEG = 0.1, 45.0
 """A visual odometry step further than this is a failure: a tick drives 0.03 m or turns 3.4
 degrees, or, against a wall, turns the robot ten degrees without moving it, so the action's
 mean cannot gate it. At capture_every 3 a wall slide turns it 21-30 degrees between frames: a
-gate or a snap below that rejects valid steps, the yaw drifts and the snap then locks onto the
+gate below that rejects valid steps, the yaw drifts and the snap then locks onto the
 wrong axis."""
 START_FRAMES = 60
 """Route 0's frames a later route's first frame is matched against, for its start yaw."""
@@ -298,10 +298,8 @@ def odometry(
                 counts["visual"] += 1
             pose = compose(pose, step)
             if confidence >= MANHATTAN_CONFIDENCE:
-                yaw = snap(pose[2], yaw_m)
-                if abs(wrap(yaw - pose[2])) <= math.radians(SNAP_DEG):
-                    pose = (pose[0], pose[1], yaw)
-                    counts["snapped"] += 1
+                pose = (pose[0], pose[1], snap(pose[2], yaw_m))
+                counts["snapped"] += 1
         poses[i] = pose
         if i % NODE_EVERY == 0:
             nodes.append(Node(view, clip_range(view.points, GRID_MAX_RANGE)))
@@ -346,7 +344,7 @@ def find_closures(tracked: list[Tracked], timer: Timer) -> tuple[list[Closure], 
     index = [(r, k) for r, t in enumerate(tracked) for k in range(len(t.nodes))]
     nodes = [tracked[r].nodes[k] for r, k in index]
     with timer.stage("vlad"):
-        extractor = Float32VLAD(cache_dir=Path("cache") / "mapping")
+        extractor = Float32VLAD(cache_dir=ROOT / "cache" / "mapping")
         fit_codebook(nodes, extractor)
         database = np.array([extractor._vlad(n.view.des) for n in nodes], np.float32)
     route = np.array([r for r, _ in index])
@@ -568,15 +566,13 @@ def build(
                 first = wall_view(route.frames[0], camera, floor)
                 reference = [
                     (tracked[0].nodes[k].view, float(tracked[0].poses[k * NODE_EVERY, 2]))
-                    for k in range(START_FRAMES // NODE_EVERY + 1)
+                    for k in range(min(START_FRAMES // NODE_EVERY + 1, len(tracked[0].nodes)))
                 ]
                 found = start_yaw(first, reference, camera.cx, camera.fx)
                 yaw = 0.0 if found is None else found
                 yaw_m, confidence = manhattan_yaw(first.points)
                 if confidence >= MANHATTAN_CONFIDENCE:
-                    snapped = snap(yaw, yaw_m)
-                    if abs(wrap(snapped - yaw)) <= math.radians(SNAP_DEG):
-                        yaw = snapped
+                    yaw = snap(yaw, yaw_m)
             starts.append((0.0, 0.0, yaw))
             tracked.append(
                 odometry(route, starts[-1], camera, floor, motion, progress=f"route {r}")

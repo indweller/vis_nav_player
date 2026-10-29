@@ -19,6 +19,7 @@ JUMP_M = 0.1
 """Replan when a fix moves the estimate this far."""
 REPLAN_EVERY = 200
 LOOKAHEAD_M = 0.1
+"""The default ``lookahead_m``."""
 
 
 class Update(NamedTuple):
@@ -27,7 +28,7 @@ class Update(NamedTuple):
     replan: str | None
     """Why a new path was made this tick: "initial", "cross_track", "jump" or "periodic"."""
     waypoint: Pose | None
-    """The first waypoint at least LOOKAHEAD_M ahead along the path."""
+    """The first waypoint at least ``lookahead_m`` ahead along the path."""
 
 
 class Navigator:
@@ -40,6 +41,7 @@ class Navigator:
         replan_m: float = REPLAN_M,
         replan_every: int = REPLAN_EVERY,
         jump_m: float = JUMP_M,
+        lookahead_m: float = LOOKAHEAD_M,
         store=None,
         corridor_m: float | None = None,
     ) -> None:
@@ -47,6 +49,7 @@ class Navigator:
         (``Path.shortcut``) before it is used."""
         self.planner, self.localiser, self.goal = planner, localiser, goal_pose
         self.replan_m, self.replan_every, self.jump_m = replan_m, replan_every, jump_m
+        self.lookahead_m = lookahead_m
         self.store, self.corridor_m = store, corridor_m
         self.tree = None if store is None or corridor_m is None else cKDTree(store.xy)
         self.path: Path | None = None
@@ -80,5 +83,5 @@ class Navigator:
                 self.path, self.since_plan = planned, 0
         waypoint = None
         if self.path is not None:
-            waypoint = self.path.waypoint_after(self.path.cross_track(pose)[1], LOOKAHEAD_M)
+            waypoint = self.path.waypoint_after(self.path.cross_track(pose)[1], self.lookahead_m)
         return Update(estimate, self.path, reason, waypoint)
