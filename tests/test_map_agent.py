@@ -3,9 +3,13 @@ texture pack and data/floor_mask.npz, and is skipped without them."""
 
 from __future__ import annotations
 
+import inspect
 import json
+import math
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from typing import NamedTuple
 
 import pytest
 
@@ -96,10 +100,16 @@ def test_arc_motion_sums_the_means_unless_the_measure_differs():
     assert off["FORWARD|LEFT"] > 0.2
 
 
+def test_defaults_online_motion_on_fixes_off():
+    defaults = inspect.signature(MapAgent.__init__).parameters
+    assert defaults["online_motion"].default is True
+    assert defaults["fixes"].default is False
+
+
 def test_steering_bands():
     agent = MapAgent.__new__(MapAgent)
     agent.turn_tol, agent.arc_deg, agent.max_turn_ticks = 12.0, 45.0, 26
-    agent.forward_ticks, agent.turn_rate = 2, 3.4375
+    agent.forward_ticks, agent.turn_rate, agent.online_motion = 2, 3.4375, False
     agent.arcs, agent.arc_radius = True, 0.5
     assert agent._steer(5.0) == ["FORWARD"] * 2
     assert agent._steer(-30.0) == ["FORWARD|RIGHT"]
@@ -112,3 +122,49 @@ def test_steering_bands():
     assert agent._steer(40.0, 0.7) == ["FORWARD|LEFT"]
     agent.arcs = False
     assert agent._steer(30.0, 1.0) == ["LEFT"] * 9
+
+
+class Estimate(NamedTuple):
+    x: float
+    y: float
+    yaw: float
+
+
+def _homing_agent(fixes: bool = True, steps: int = 0, view=None):
+    """A MapAgent with the state ``_home`` reads, the goal at the origin facing 0."""
+    agent = MapAgent.__new__(MapAgent)
+    agent.fixes, agent.homing_max, agent.homing_steps = fixes, 60, steps
+    agent.align_deg, agent.offset_m, agent.turn_tol, agent.turn_rate = 8.0, 0.05, 12.0, 3.4375
+    agent.online_motion = False
+    agent.approaching, agent.timed_out, agent.view = False, False, view
+    agent.goal = (0.0, 0.0, 0.0)
+    agent.update = SimpleNamespace(estimate=Estimate(0.0, 0.0, math.radians(-20)))
+    agent._yaw_to_view0 = lambda image: 20.0
+    return agent
+
+
+def test_homing_timeout_turns_by_the_estimate_before_checking_in():
+    agent = _homing_agent(steps=60)
+    assert (
+        agent._home(SimpleNamespace(image=None)) == ["LEFT"] * 3
+    )  # 20 degrees off: turn, don't check in
+    assert agent.timed_out
+    agent.update.estimate = Estimate(0.0, 0.0, 0.05)  # 2.9 degrees
+    assert agent._home(SimpleNamespace(image=None)) == ["CHECKIN"]
+    assert agent.checkin_reason == "homing_max"
+
+
+def test_homing_timeout_checks_in_at_once_without_fixes():
+    agent = _homing_agent(fixes=False, steps=60)
+    assert agent._home(SimpleNamespace(image=None)) == ["CHECKIN"]
+
+
+def test_estimate_alignment_is_tighter_than_the_view_alignment():
+    agent = _homing_agent()
+    agent._yaw_to_view0 = lambda image: 6.0
+    agent.view = None  # no view matched: 6 degrees is over the 5 degree estimate tolerance
+    assert agent._home(SimpleNamespace(image=None))[0] == "LEFT"
+    agent = _homing_agent()
+    agent._yaw_to_view0 = lambda image: 6.0
+    agent.view = (0, 6.0)  # a matched view: 6 degrees is under the 8 degree tolerance
+    assert agent._home(SimpleNamespace(image=None)) == ["CHECKIN"]

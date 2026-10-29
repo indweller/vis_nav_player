@@ -53,7 +53,7 @@ from geometry import (
 )
 from my_agent import Float32VLAD
 from scipy.optimize import least_squares
-from scipy.sparse import coo_matrix
+from scipy.sparse import coo_matrix, csr_matrix
 from servo import Servo
 from sklearn.cluster import KMeans
 from tqdm import tqdm
@@ -76,11 +76,13 @@ ROUNDS = 3
 GRID_MAX_RANGE = 0.8
 """Wall points beyond this range, metres, are left out of the map: a row of the wall's foot is
 ~0.05 m of range at 0.8 m, ~0.12 m at 1.5 m."""
-SNAP_DEG = 20.0
-MAX_STEP_M, MAX_STEP_DEG = 0.1, 20.0
+SNAP_DEG = 45.0
+MAX_STEP_M, MAX_STEP_DEG = 0.1, 45.0
 """A visual odometry step further than this is a failure: a tick drives 0.03 m or turns 3.4
 degrees, or, against a wall, turns the robot ten degrees without moving it, so the action's
-mean cannot gate it."""
+mean cannot gate it. At capture_every 3 a wall slide turns it 21-30 degrees between frames: a
+gate or a snap below that rejects valid steps, the yaw drifts and the snap then locks onto the
+wrong axis."""
 START_FRAMES = 60
 """Route 0's frames a later route's first frame is matched against, for its start yaw."""
 START_MIN_INLIERS = 15
@@ -90,9 +92,11 @@ HORIZON_SHIFT_PX = 1.0
 boundary as a pixel-corner coordinate against a pixel-centre cy, and the wall's foot is on
 average half a row above the boundary: unshifted, ranges (and so visual odometry) read ~5%
 short of a forward tick's 0.03 m on mazes 7-9 (0.99 shifted)."""
-ODOM_SIGMA_M, ODOM_SIGMA_DEG = 0.01, 1.0
-"""A node-to-node odometry edge's spread: the visual odometry drifts ~1 %. A looser spread lets
-a few mutually consistent aliased closures (the same wall texture elsewhere) bend the graph."""
+ODOM_SIGMA_M, ODOM_SIGMA_DEG = 0.0073, 0.97
+"""A node-to-node odometry edge's spread: the measured per-frame visual odometry error (3.3 mm,
+0.43 degrees per axis) times sqrt(NODE_EVERY). A looser
+spread lets a few mutually consistent aliased closures (the same wall texture elsewhere) bend the
+graph."""
 CLOSURE_SIGMA_M, CLOSURE_SIGMA_DEG = 0.05, 2.0
 START_SIGMA_M, START_SIGMA_DEG = 0.001, 3.0
 """A route's start prior: the position is exact; the yaw is as sure as the SIFT match."""
@@ -432,24 +436,40 @@ def optimise(
     e_cols = e_cols[:, None, :] + np.zeros((1, 3, 1), int)
     a_rows = 3 * m + 3 * np.arange(len(anchors))[:, None] + np.arange(3)
     a_cols = 3 * anchors[:, None] + np.arange(3)
-    sparsity = coo_matrix(
-        (
-            np.ones(e_rows.size + a_rows.size),
-            (
-                np.concatenate([e_rows.ravel(), a_rows.ravel()]),
-                np.concatenate([e_cols.ravel(), a_cols.ravel()]),
-            ),
-        ),
-        shape=(3 * m + 3 * len(anchors), 3 * n),
-    )
+    rows = np.concatenate([e_rows.ravel(), a_rows.ravel()])
+    cols = np.concatenate([e_cols.ravel(), a_cols.ravel()])
+    shape = (3 * m + 3 * len(anchors), 3 * n)
+    sparsity = coo_matrix((np.ones(len(rows)), (rows, cols)), shape=shape)
+    a_data = (1.0 / np.tile(anchor_sigma, len(anchors))).reshape(-1, 3)
+
+    def jacobian(x: np.ndarray) -> csr_matrix:
+        """d residuals / d x: an edge's rows hold d/d(x_i, y_i, yaw_i, x_j, y_j, yaw_j)."""
+        p = x.reshape(n, 3)
+        c, s = np.cos(p[i, 2]), np.sin(p[i, 2])
+        d = p[j, :2] - p[i, :2]
+        lx, ly = c * d[:, 0] + s * d[:, 1], -s * d[:, 0] + c * d[:, 1]
+        sx, sa = sigma[:, 0], sigma[:, 1]
+        z = np.zeros(m)
+        data = np.stack(
+            [
+                np.stack([-c / sx, -s / sx, ly / sx, c / sx, s / sx, z], axis=1),
+                np.stack([s / sx, -c / sx, -lx / sx, -s / sx, c / sx, z], axis=1),
+                np.stack([z, z, -1 / sa, z, z, 1 / sa], axis=1),
+            ],
+            axis=1,
+        )
+        return csr_matrix(
+            (np.concatenate([data.ravel(), a_data.ravel()]), (rows, cols)), shape=shape
+        )
+
     result = least_squares(
         residuals,
         initial.ravel(),
+        jac=jacobian,
         jac_sparsity=sparsity,
         loss="huber",
         f_scale=HUBER_SCALE,
         x_scale="jac",
-        max_nfev=60,
     )
     return result.x.reshape(n, 3)
 

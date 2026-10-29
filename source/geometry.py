@@ -24,6 +24,8 @@ from scipy.spatial import cKDTree
 CAMERA_HEIGHT = 0.20
 """Metres from the floor to the camera, measured from renders. The camera dict's height_offset
 (0.15) is not the camera's height."""
+CAMERA = {"width": 320, "height": 240, "fx": 92.0, "fy": 92.0, "cx": 160.0, "cy": 120.0}
+"""The challenge's camera (the simulator's default course camera): frame size and intrinsics."""
 FAR = 5.0
 """The renderer's far plane: ranges are capped at it."""
 LUT_BINS = 16
@@ -191,6 +193,21 @@ def free_space(camera: Camera, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray
     ranges = camera.ranges(edge.astype(float))
     ranges[first == below.shape[0]] = FAR
     return ranges, first > 0
+
+
+FLOOR_BAND_PX = 20
+"""``floor_fraction`` reads the columns within this many pixels of cx."""
+FLOOR_ROWS = 10
+"""``floor_fraction`` reads this many rows from the bottom of the frame."""
+
+
+def floor_fraction(mask: np.ndarray, camera: Camera) -> float:
+    """The fraction of floor pixels in the bottom FLOOR_ROWS rows of the central columns
+    (cx +- FLOOR_BAND_PX) of a floor ``mask``: a wall filling the foot of the frame is a wall
+    close ahead, even where no wall range can be read."""
+    lo = max(int(camera.cx) - FLOOR_BAND_PX, 0)
+    hi = min(int(camera.cx) + FLOOR_BAND_PX + 1, mask.shape[1])
+    return float(mask[-FLOOR_ROWS:, lo:hi].mean())
 
 
 def ranges(image: np.ndarray, camera: Camera, floor: FloorMask) -> tuple[np.ndarray, np.ndarray]:

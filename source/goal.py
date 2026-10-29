@@ -47,6 +47,11 @@ NEAR_M = 1.0
 DISTINCT_M = 0.3
 """Two candidate locations closer than this are one place."""
 SERVO_MIN_MATCHES = 8
+TARGET_CAMERA_HEIGHT = 0.15
+"""Metres from the floor to the camera of the goal photos: lower than the renders' (fitted by
+eval_goal_photos --fit; their ranges then match renders at the target, ratio 0.99)."""
+TARGET_CY_SHIFT = 0.0
+"""Pixels added to cy for the goal photos, on top of mapping.HORIZON_SHIFT_PX."""
 
 
 class Candidate(NamedTuple):
@@ -84,6 +89,21 @@ class Goal(NamedTuple):
     DISTINCT_M of the chosen one."""
 
 
+def target_camera(camera: Camera) -> Camera:
+    """``camera`` as the goal photos see it: their height and cy shift."""
+    return Camera(
+        {
+            "width": camera.width,
+            "height": camera.rows,
+            "fx": camera.fx,
+            "fy": camera.fy,
+            "cx": camera.cx,
+            "cy": camera.cy + TARGET_CY_SHIFT,
+        },
+        TARGET_CAMERA_HEIGHT,
+    )
+
+
 def goal_scan(seen: list[WallView]) -> np.ndarray:
     """The four views' wall points in the goal's frame: view k looks 90 degrees * k to the left
     of the goal's heading, from the same place."""
@@ -99,12 +119,15 @@ def find_goal(
     floor: FloorMask,
     ranking: list[Candidate] | None = None,
     layout_min: float = LAYOUT_MIN,
+    photographed: bool = True,
 ) -> Goal | None:
     """The goal from its four BGR ``views``; None when no frame matches any of them. A list
-    passed as ``ranking`` is filled with the scored candidates, best by inliers first."""
+    passed as ``ranking`` is filled with the scored candidates, best by inliers first. The views
+    are read with the goal photos' camera (``target_camera``) unless ``photographed`` is False."""
     sift = cv2.SIFT_create()
     rng = np.random.default_rng(0)
-    seen = [wall_view(v, camera, floor, sift) for v in views]
+    seeing = target_camera(camera) if photographed else camera
+    seen = [wall_view(v, seeing, floor, sift) for v in views]
     scored = []  # (inliers, frame row, k, matches[inliers])
     for k, view in enumerate(seen):
         if view.des is None:

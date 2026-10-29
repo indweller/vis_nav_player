@@ -40,6 +40,17 @@ every plan (``--corridor-m``). The arcs' motion is measured on the
 simulator (no noise, 50 ticks each) and printed; MapAgent uses it where the sum of the FORWARD and
 turn means is off by over 20%.
 
+--seeds N (default 3) drives each maze and goal with N motion seeds (the maze's plus
+MOTION_SEED_OFFSET, plus 1000 per extra). --configs names agent configurations to compare, each
+built on the last (CONFIGS: baseline = no alignment fixes; fixes = the goal photo camera and the
+final alignment; shortcut; arcs); none given, the agent is built from the flags. Per config the
+summary gives mean points +- std, the success rate (check-in within SUCCESS_M and SUCCESS_DEG of
+the goal), mean SPL (the simulator's) and the failure stage counts of the runs that failed (the
+first that applies: goal error > 0.2 m / localisation lost / homing timeout / heading > 20 deg /
+distance > 0.2 m).
+
+    uv run source/eval/eval_closed_loop.py --goals found --configs baseline,fixes,shortcut,arcs
+
 Writes to results/eval/closed_loop/: runs.csv, ticks.csv and <seed>_<goal>.png (true walls, true
 trajectory in black, estimated in blue, goal true in green, map-true in blue and found in red,
 replans as orange dots and wall-guard events as red crosses, both at the robot's true position)."""
@@ -77,6 +88,26 @@ MOTION_SEED_OFFSET = 1000
 MAX_STEPS = 3000
 FALSE_FIX_M = 0.3
 HELD_OUT = (10, 11, 12)
+SEEDS = 3
+"""Motion seeds per maze and goal."""
+SEED_STEP = 1000
+"""Between one motion seed and the next."""
+GOAL_ERROR_M = 0.2
+SUCCESS_M = 0.2
+SUCCESS_DEG = 20.0
+CONFIGS = {
+    "baseline": {"fixes": False, "goal_camera": "frame"},
+    "fixes": {"fixes": True},
+    "shortcut": {"fixes": True, "shortcut": True},
+    "arcs": {"fixes": True, "shortcut": True, "arcs": True},
+}
+STAGES = (
+    "goal error",
+    "localisation lost",
+    "homing timeout",
+    "heading",
+    "distance",
+)
 BLOCKS = ("Distance", "Heading", "SPL")
 ACTIONS = ("FORWARD", "BACKWARD", "LEFT", "RIGHT", "FORWARD|LEFT", "FORWARD|RIGHT")
 ARC_SEEDS = (7, 8)
@@ -84,7 +115,9 @@ ARC_TICKS = 50
 ARC_RUN = 5
 """Ticks of an arc taken from one start."""
 FIELDS = [
+    "config",
     "seed",
+    "motion",
     "goal",
     "ticks",
     "checkin_reason",
@@ -135,7 +168,9 @@ FIELDS = [
     "sdk_arrival_deg",
 ]
 TICK_FIELDS = [
+    "config",
     "seed",
+    "motion",
     "goal",
     "tick",
     "true_x",
@@ -229,13 +264,17 @@ def measure_arcs() -> dict[str, dict]:
     }
 
 
-def drive(agent: ServerFrames, maze: Maze, args) -> dict:
+def motion_seed(maze: Maze, motion: int) -> int:
+    return maze.seed + MOTION_SEED_OFFSET + SEED_STEP * motion
+
+
+def drive(agent: ServerFrames, maze: Maze, args, motion: int = 0) -> dict:
     """One run on a local session, logged tick by tick: ``{"log": [...], "result": ...}``."""
     session = local_session(
         f"local:{maze.seed}",
         textures=textures(),
         motion_noise=sim.DEFAULT_NOISE,
-        motion_seed=maze.seed + MOTION_SEED_OFFSET,
+        motion_seed=motion_seed(maze, motion),
         max_steps=args.max_steps,
     )
     agent.setup(session.info)
@@ -287,7 +326,7 @@ def drive(agent: ServerFrames, maze: Maze, args) -> dict:
     }
 
 
-def sdk_score(agent: ServerFrames, maze: Maze, args):
+def sdk_score(agent: ServerFrames, maze: Maze, args, motion: int = 0):
     """The SDK's own local scorer on the same session."""
     return run(
         agent,
@@ -299,7 +338,7 @@ def sdk_score(agent: ServerFrames, maze: Maze, args):
         browser=False,
         textures=textures(),
         motion_noise=sim.DEFAULT_NOISE,
-        motion_seed=maze.seed + MOTION_SEED_OFFSET,
+        motion_seed=motion_seed(maze, motion),
         max_steps=args.max_steps,
     )
 
@@ -328,7 +367,9 @@ def longest_stall(geodesic_m: list[float]) -> int:
     return longest
 
 
-def score_run(maze: Maze, goal: str, run_: dict, sdk) -> tuple[dict, list[dict]]:
+def score_run(
+    maze: Maze, goal: str, run_: dict, sdk, config: str = "", motion: int = 0
+) -> tuple[dict, list[dict]]:
     log = run_["log"]
     column = lambda key: np.array([t[key] for t in log], float)  # noqa: E731
     estimate, consistent = column("estimate"), column("consistent")
@@ -344,7 +385,9 @@ def score_run(maze: Maze, goal: str, run_: dict, sdk) -> tuple[dict, list[dict]]
     pulled = [seg for p in shortcut for seg in p.pulled]
     crossing = sum(maze.crosses_wall(a, b) for a, b in pulled)
     row = {
+        "config": config,
         "seed": maze.seed,
+        "motion": motion,
         "goal": goal,
         "ticks": run_["nav_steps"],
         "checkin_reason": run_["reason"],
@@ -401,7 +444,9 @@ def score_run(maze: Maze, goal: str, run_: dict, sdk) -> tuple[dict, list[dict]]
     for i, t in enumerate(log):
         ticks.append(
             {
+                "config": config,
                 "seed": maze.seed,
+                "motion": motion,
                 "goal": goal,
                 "tick": t["tick"],
                 **dict(zip(("true_x", "true_y", "true_yaw"), t["true"], strict=True)),
@@ -458,43 +503,55 @@ def draw(maze: Maze, run_: dict, found: tuple, row: dict, path: Path) -> None:
 
 def evaluate(seed: int, args, out: Path) -> tuple[list[dict], list[dict]]:
     root = record(seed)
-    agent = ServerFrames(root, **agent_options(args))
-    maze = Maze(seed, agent, root)
-    agent.encode = maze.world.jpeg
+    configs = args.configs or {"": {}}
+    agents = {
+        name: ServerFrames(root, **{**agent_options(args), **options})
+        for name, options in configs.items()
+    }
+    first = next(iter(agents.values()))
+    maze = Maze(seed, first, root)
     print(
-        f"maze {seed}: {agent.planner.n} nodes, true goal ({maze.true_goal[0]:.2f}, "
+        f"maze {seed}: {first.planner.n} nodes, true goal ({maze.true_goal[0]:.2f}, "
         f"{maze.true_goal[1]:.2f}) in the map frame",
         flush=True,
     )
     rows, ticks, runs = [], [], {}
     found = maze.true_goal
-    for goal in args.goals:
-        agent.goal_override = {
-            "found": None,
-            "true": maze.true_goal,
-            "map-true": tuple(maze.consistent_goal),
-        }[goal]
-        run_ = drive(agent, maze, args)
-        if goal == "found" and run_["goal"] is not None:
-            found = run_["goal"]
-        sdk = None if args.no_sdk else sdk_score(agent, maze, args)
-        row, tick_rows = score_run(maze, goal, run_, sdk)
-        if sdk is not None and sdk.nav_steps != row["ticks"]:
-            print(
-                f"  note: the SDK's run took {sdk.nav_steps} steps, the logged one {row['ticks']}"
-            )
-        rows.append(row)
-        ticks.extend(tick_rows)
-        runs[goal] = run_
-        print(
-            f"  {goal:<8} {row['tier']:<7} {row['distance_m']:.2f} m "
-            f"{row['heading_deg']:>5.0f} deg {row['ticks']:>5} ticks ({row['checkin_reason']})  "
-            f"points {row['score_points']:g}",
-            flush=True,
-        )
+    for config, agent in agents.items():
+        agent.encode = maze.world.jpeg
+        for goal in args.goals:
+            agent.goal_override = {
+                "found": None,
+                "true": maze.true_goal,
+                "map-true": tuple(maze.consistent_goal),
+            }[goal]
+            for motion in range(args.seeds):
+                run_ = drive(agent, maze, args, motion)
+                if goal == "found" and motion == 0 and run_["goal"] is not None:
+                    found = run_["goal"]
+                sdk = None if args.no_sdk else sdk_score(agent, maze, args, motion)
+                row, tick_rows = score_run(maze, goal, run_, sdk, config, motion)
+                if sdk is not None and sdk.nav_steps != row["ticks"]:
+                    print(
+                        f"  note: the SDK's run took {sdk.nav_steps} steps, "
+                        f"the logged one {row['ticks']}"
+                    )
+                rows.append(row)
+                ticks.extend(tick_rows)
+                if motion == 0:
+                    runs[config, goal] = run_
+                print(
+                    f"  {config or 'flags':<8} {goal:<8} #{motion} {row['tier']:<7} "
+                    f"{row['distance_m']:.2f} m {row['heading_deg']:>5.0f} deg "
+                    f"{row['ticks']:>5} ticks ({row['checkin_reason']})  "
+                    f"points {row['score_points']:g}",
+                    flush=True,
+                )
+        agent.store.sift.flush()
     for row in rows:
-        draw(maze, runs[row["goal"]], found, row, out / f"{seed}_{row['goal']}.png")
-    agent.store.sift.flush()
+        if row["motion"] == 0:
+            label = f"{seed}_{row['goal']}" + (f"_{row['config']}" if row["config"] else "")
+            draw(maze, runs[row["config"], row["goal"]], found, row, out / f"{label}.png")
     return rows, ticks
 
 
@@ -514,7 +571,52 @@ def agent_options(args) -> dict:
         "align_deg": args.align_deg,
         "offset_m": args.offset_m,
         "homing_max": args.homing_max,
+        "fixes": not args.no_fixes,
+        "goal_camera": "photo",
     }
+
+
+def failure_stage(row: dict) -> str | None:
+    """The first stage a run failed at (None: it succeeded)."""
+    if (
+        row["distance_m"] <= SUCCESS_M
+        and abs(row["heading_deg"]) <= SUCCESS_DEG
+        and row["goal_cm_err_m"] <= GOAL_ERROR_M
+    ):
+        return None
+    if row["goal_cm_err_m"] > GOAL_ERROR_M:
+        return STAGES[0]
+    if row["lost_events"] > 0:
+        return STAGES[1]
+    if row["checkin_reason"] == "homing_max":
+        return STAGES[2]
+    if abs(row["heading_deg"]) > SUCCESS_DEG:
+        return STAGES[3]
+    return STAGES[4]
+
+
+def summarise_configs(rows: list[dict]) -> None:
+    """Per config and goal: points, success rate, SPL and the failure stages."""
+    print(
+        f"\n{'config':<9} {'goal':<8} {'runs':>4} | {'points':>13} {'success':>7} {'spl':>5} | "
+        + " ".join(f"{s:>17}" for s in STAGES)
+    )
+    for config in dict.fromkeys(r["config"] for r in rows):
+        for goal in dict.fromkeys(r["goal"] for r in rows if r["config"] == config):
+            chosen = [r for r in rows if r["config"] == config and r["goal"] == goal]
+            points = np.array([r["score_points"] for r in chosen])
+            stages = Counter(failure_stage(r) for r in chosen)
+            print(
+                f"{config:<9} {goal:<8} {len(chosen):>4} | "
+                f"{points.mean():>6.2f} +- {points.std():<4.2f} "
+                f"{np.mean([failure_stage(r) is None for r in chosen]):>7.0%} "
+                f"{np.mean([r['spl'] for r in chosen]):>5.2f} | "
+                + " ".join(f"{stages[s]:>17}" for s in STAGES)
+            )
+    print(
+        f"(points: mean +- std over runs; success: distance <= {SUCCESS_M} m, heading <= "
+        f"{SUCCESS_DEG:g} deg and goal error <= {GOAL_ERROR_M} m; stages count the failures)"
+    )
 
 
 def summarise(rows: list[dict]) -> None:
@@ -599,6 +701,10 @@ def main() -> None:
     )
     p.add_argument("--mazes", default="7,8,9,10,11,12", help="comma-separated maze seeds")
     p.add_argument("--goals", default=",".join(GOALS), help="found, true or both")
+    p.add_argument("--seeds", type=int, default=SEEDS, help="motion seeds per maze and goal")
+    p.add_argument(
+        "--configs", default="", help=f"comma-separated agent configs to compare: {list(CONFIGS)}"
+    )
     p.add_argument("--out-dir", default="results/eval", help="where closed_loop/ goes")
     p.add_argument("--max-steps", type=int, default=MAX_STEPS, help="the session's step budget")
     p.add_argument("--no-sdk", action="store_true", help="skip the SDK scorer's second run")
@@ -615,8 +721,10 @@ def main() -> None:
     p.add_argument("--align-deg", type=float, default=map_agent.ALIGN_DEG)
     p.add_argument("--offset-m", type=float, default=map_agent.OFFSET_M)
     p.add_argument("--homing-max", type=int, default=map_agent.HOMING_MAX)
+    p.add_argument("--no-fixes", action="store_true", help="the goal camera and alignment off")
     args = p.parse_args()
     args.goals = [g for g in args.goals.split(",") if g]
+    args.configs = {name: CONFIGS[name] for name in args.configs.split(",") if name}
 
     stored_floor()
     args.arc_measured = measure_arcs()
@@ -633,6 +741,7 @@ def main() -> None:
     write_csv(out / "runs.csv", FIELDS, rows)
     write_csv(out / "ticks.csv", TICK_FIELDS, ticks)
     summarise(rows)
+    summarise_configs(rows)
 
 
 if __name__ == "__main__":

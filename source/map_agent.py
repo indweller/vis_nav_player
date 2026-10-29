@@ -21,6 +21,13 @@ the localiser sees every frame:
   - with --shortcut, every plan is string-pulled (``Path.shortcut``, --corridor-m);
   - wall guard: a FORWARD with the centre column's wall range under --guard-m becomes BACKWARD
     for 2 ticks, and the path is replanned;
+  - with --floor-guard, the same when the floor fills under --floor-guard-frac of the bottom
+    rows of the central columns (a wall closer than about 0.15 m, which the wall range cannot read);
+  - with --blocked-zero, a FORWARD / BACKWARD tick on which visual odometry fails and the frame
+    differs from the previous one by under --blocked-diff (grey, downsampled) is assumed to have
+    gone nowhere, rather than to have moved by the calibrated mean;
+  - unless --no-online-motion, the localiser's fallback motion and the turn rate are the medians of
+    the run's own visual odometry steps per action, once there are 20;
   - homing, once the estimate is within --near-m of the goal (and from then on): the localiser
     tries a fix every tick against the mapped frames within 0.5 m of the goal (its SIFT and layout
     checks). The target is the goal pose. The frame is matched against the four goal views by
@@ -28,9 +35,15 @@ the localiser sees every frame:
     when none matches; the views match only within about 0.1 m of the goal). Turn until that is
     under --align-deg; then, if the estimate is over --offset-m from the goal, step toward it, a
     tick at a time (along the heading if it is off that way only; else turn to it and drive,
-    aligning again once there); CHECKIN when aligned and within --offset-m, or after --homing-max
-    homing decisions.
-  - CHECKIN when fewer than 5 steps are left.
+    aligning again once there); CHECKIN when aligned and within --offset-m.
+    With --fixes (off by default): the goal view overrides the estimate's yaw only with at least
+    15 inliers (else 8) and within 30 degrees of it. Without a match the estimate's yaw (against
+    the goal's from find_goal) must be under 5 degrees. After --homing-max homing decisions the
+    agent turns by the estimate alone to that yaw error and then checks in, wherever it is;
+    without --fixes it checks in at once.
+  - CHECKIN when fewer than 5 steps are left (the only check-in before alignment).
+  - At check-in the homing outcome and the heading error (the estimate's, against the goal's yaw)
+    are printed.
 
     uv run source/map_agent.py --local 7
     uv run source/map_agent.py --challenge <id>
@@ -44,11 +57,12 @@ from pathlib import Path
 
 import cli
 import frozen_map
+import geometry
 import mapping
 import navigator as navigator_module
 import numpy as np
 import planner as planner_module
-from geometry import Camera, FloorMask
+from geometry import Camera, FloorMask, floor_fraction
 from goal import find_goal
 from localiser import Localiser
 from mapping import between, wrap
@@ -57,8 +71,6 @@ from vis_nav_sdk import Action, Agent, Observation, Result, SessionInfo, run
 
 FLOOR_MASK_PATH = cli.ROOT / "data" / "floor_mask.npz"
 MOTION_NAME = "motion.json"
-FOV_DEG = 120.0
-"""The camera's horizontal field of view; with the frame size it gives fx."""
 DEFAULT_TURN_DEG = 3.4375
 
 LOOKAHEAD_M = 0.15
@@ -75,26 +87,30 @@ ARC_TOLERANCE = 0.2
 ARCS = {"LEFT": "FORWARD|LEFT", "RIGHT": "FORWARD|RIGHT"}
 GUARD_M = 0.07
 GUARD_TICKS = 2
+FLOOR_GUARD_FRAC = 0.49
+"""``--floor-guard``: the floor fraction of the central bottom rows under which a wall is under
+0.15 m away (fitted on a dev-like run, F1 0.98: eval_dev_like_flags.py)."""
+BLOCKED_DIFF = 17.3
+"""``--blocked-zero``: the grey difference (localiser.grey_difference) under which a failed-VO
+FORWARD / BACKWARD tick is taken as blocked (fitted on a dev-like run, F1 0.97)."""
 NEAR_M = 0.15
 ALIGN_DEG = 8.0
 OFFSET_M = 0.05
 HOMING_MAX = 60
 VIEW_GATE_DEG = 30.0
 """Homing believes a goal view's yaw only within this of the estimate's."""
-SERVO_MIN_MATCHES = 8
+ESTIMATE_ALIGN_DEG = 5.0
+"""Without a goal view match, the estimate's yaw error must be under this to check in."""
+LEGACY_MIN_MATCHES = 8
+"""SERVO_MIN_MATCHES before the alignment fixes (``fixes=False``)."""
+SERVO_MIN_MATCHES = 15
 """Inliers the servo needs between the frame and a goal view (the views match only near)."""
 LOW_STEPS = 5
 """CHECKIN when fewer steps than this are left."""
 
+GOAL_CAMERAS = ("auto", "frame", "photo")
+
 Pose = tuple[float, float, float]
-
-
-def camera_dict(frame: np.ndarray) -> dict:
-    """The camera of the challenge's frames: the size of ``frame``, a 120 degree field of view
-    and the principal point at the centre."""
-    height, width = frame.shape[:2]
-    fx = float(round(width / 2 / math.tan(math.radians(FOV_DEG / 2))))
-    return {"width": width, "height": height, "fx": fx, "fy": fx, "cx": width / 2, "cy": height / 2}
 
 
 def load_motion(root: Path, routes, camera: Camera, floor: FloorMask) -> dict[str, dict]:
@@ -150,11 +166,33 @@ class MapAgent(Agent):
         align_deg: float = ALIGN_DEG,
         offset_m: float = OFFSET_M,
         homing_max: int = HOMING_MAX,
+        fixes: bool = False,
+        goal_camera: str = "auto",
+        floor_guard: bool = False,
+        floor_guard_frac: float = FLOOR_GUARD_FRAC,
+        blocked_zero: bool = False,
+        blocked_diff: float = BLOCKED_DIFF,
+        online_motion: bool = True,
     ) -> None:
         """``goal_override``: a goal pose in the map frame, used instead of ``find_goal``.
         ``arcs``: steer with arcs; ``max_turn_ticks`` is then ARC_MAX_TURN_TICKS unless given.
         ``shortcut``: shortcut every plan, within ``corridor_m`` of the mapped frames.
-        ``arc_measured``: measured arc motion for ``arc_motion``."""
+        ``arc_measured``: measured arc motion for ``arc_motion``.
+        ``fixes``: True turns the final alignment on (the 5 degree estimate alignment, the 15
+        inlier view gate, the turn after a homing timeout); off by default.
+        ``goal_camera``: the camera the goal photos are read with: "frame" (the exploration
+        frames' own camera), "photo" (the lower goal.TARGET_CAMERA_HEIGHT camera, which
+        targets() renders with), or "auto": "photo", on local and server challenges alike.
+        ``online_motion``: the fallback motion and turn rate from the run's own visual odometry
+        (on by default; see the module docstring).
+        ``floor_guard``, ``blocked_zero``: the options of the module docstring, each off by
+        default; ``floor_guard_frac`` and ``blocked_diff`` are their thresholds."""
+        if goal_camera not in GOAL_CAMERAS:
+            raise ValueError(f"goal_camera must be one of {GOAL_CAMERAS}, not {goal_camera!r}")
+        self.goal_camera = goal_camera
+        self.floor_guard, self.floor_guard_frac = floor_guard, floor_guard_frac
+        self.blocked_zero = blocked_diff if blocked_zero else None
+        self.online_motion = online_motion
         self.root = Path(data_dir)
         self.goal_override = goal_override
         self.lookahead_m, self.turn_tol, self.forward_ticks = lookahead_m, turn_tol, forward_ticks
@@ -164,11 +202,14 @@ class MapAgent(Agent):
         self.max_turn_ticks = max_turn_ticks
         self.corridor_m = corridor_m if shortcut else None
         self.guard_m, self.near_m, self.align_deg = guard_m, near_m, align_deg
-        self.offset_m, self.homing_max = offset_m, homing_max
+        self.offset_m, self.homing_max, self.fixes = offset_m, homing_max, fixes
 
         self.floor = FloorMask.load(FLOOR_MASK_PATH)
         routes = mapping.load_routes(self.root)
-        self.camera_dict = camera_dict(routes[0].frames[0])
+        shape = routes[0].frames[0].shape[:2]
+        size = (geometry.CAMERA["height"], geometry.CAMERA["width"])
+        assert shape == size, f"exploration frames are {shape} (rows, cols), CAMERA is {size}"
+        self.camera_dict = dict(geometry.CAMERA)
         self.camera = Camera(
             {**self.camera_dict, "cy": self.camera_dict["cy"] + mapping.HORIZON_SHIFT_PX}
         )
@@ -200,26 +241,67 @@ class MapAgent(Agent):
         self.checkin_reason: str | None = None
         self.homing = False
         self.homing_steps = 0
+        self.timed_out = False
+        """Homing: --homing-max decisions made; turning by the estimate to check in."""
+        self.heading_error: float | None = None
+        """Degrees to turn left to the goal's yaw, by the estimate, at check-in."""
         self.approaching = False
         """Homing: driving to the goal sideways-on, not holding the alignment."""
         self.guard_events = 0
+        self.floor_guard_events = 0
+        """Guard events caused by the floor fraction alone (counted in ``guard_events`` too)."""
+        self.floor_frac = math.nan
+        """The floor fraction of the latest frame (NaN: --floor-guard is off)."""
         self.replan_pending = False
         self.guarded = False
         """The wall guard fired on this tick."""
+        self.guard_cause: str | None = None
+        """"centre" (the centre range) or "floor" (the floor fraction alone) on a guard tick."""
         self.view: tuple[int, float] | None = None
         """Homing: the goal view the frame matched and the yaw to view 0 it gave."""
         self.result: Result | None = None
 
     # -- the session
 
+    @staticmethod
+    def check_camera(camera) -> None:
+        """Warn (never fail) if the session's camera differs from geometry.CAMERA."""
+        if camera is None:
+            return
+        seen = {k: getattr(camera, k) for k in geometry.CAMERA}
+        off = {k: (seen[k], v) for k, v in geometry.CAMERA.items() if seen[k] != v}
+        if off:
+            print(
+                "WARNING: the session's camera differs from geometry.CAMERA (session, expected): "
+                + ", ".join(f"{k} {a} vs {b}" for k, (a, b) in off.items()),
+                flush=True,
+            )
+
     def setup(self, info: SessionInfo) -> None:
         self.reset()
-        self.localiser = Localiser(self.store, self.camera, self.floor, motion=self.motion)
+        self.check_camera(getattr(info, "camera", None))
+        self.localiser = Localiser(
+            self.store,
+            self.camera,
+            self.floor,
+            motion=self.motion,
+            blocked_zero=self.blocked_zero,
+            online_motion=self.online_motion,
+        )
         if self.goal_override is not None:
             self.goal = tuple(float(v) for v in self.goal_override)
         else:
-            found = find_goal(info.targets, self.store, self.camera, self.floor)
+            mode = "photo" if self.goal_camera == "auto" else self.goal_camera
+            found = find_goal(
+                info.targets, self.store, self.camera, self.floor, photographed=mode == "photo"
+            )
             self.goal = None if found is None else (found.x, found.y, found.yaw)
+            pose = (
+                "none"
+                if found is None
+                else f"({found.x:.2f}, {found.y:.2f}) {math.degrees(found.yaw):.0f} deg"
+            )
+            print(f"goal camera: {mode}; goal pose: {pose}", flush=True)
         self.found_goal = self.goal
         if self.goal is not None:
             self.navigator = navigator_module.Navigator(
@@ -229,7 +311,8 @@ class MapAgent(Agent):
                 store=self.store,
                 corridor_m=self.corridor_m,
             )
-        self.servo = Servo(self.camera.fx, cx=self.camera.cx, min_matches=SERVO_MIN_MATCHES)
+        min_matches = SERVO_MIN_MATCHES if self.fixes else LEGACY_MIN_MATCHES
+        self.servo = Servo(self.camera.fx, cx=self.camera.cx, min_matches=min_matches)
         self.goal_features = [self.servo.features(t) for t in info.targets]
 
     def finish(self, result: Result | None) -> None:
@@ -237,7 +320,10 @@ class MapAgent(Agent):
 
     def act(self, obs: Observation) -> tuple[Action, int]:
         self.guarded = False
+        self.guard_cause = None
         self.view = None
+        if self.floor_guard:
+            self.floor_frac = floor_fraction(self.floor(obs.image), self.camera)
         if self.navigator is None:
             estimate = self.localiser.step(obs.image, self.last)
             self.update = navigator_module.Update(estimate, None, None, None)
@@ -258,8 +344,11 @@ class MapAgent(Agent):
 
     def _move(self, name: str, obs: Observation) -> tuple[Action, int]:
         """One tick of ``name``, unless the wall guard turns a FORWARD into a retreat."""
-        if name.startswith("FORWARD") and self._centre_range() < self.guard_m:
+        close = self.floor_guard and self.floor_frac < self.floor_guard_frac
+        if name.startswith("FORWARD") and (self._centre_range() < self.guard_m or close):
             self.guard_events += 1
+            self.guard_cause = "centre" if self._centre_range() < self.guard_m else "floor"
+            self.floor_guard_events += int(self._centre_range() >= self.guard_m)
             self.guarded = True
             self.mode, self.replan_pending = "guard", True
             self.queue = ["BACKWARD"] * (GUARD_TICKS - 1)
@@ -272,6 +361,18 @@ class MapAgent(Agent):
 
     def _checkin(self, reason: str) -> tuple[Action, int]:
         self.checkin_reason, self.last, self.queue = reason, None, []
+        estimate = self.update.estimate
+        self.heading_error = math.degrees(wrap(self.goal[2] - estimate.yaw)) if self.goal else None
+        outcome = {"homed": "aligned", "homing_max": "timed out"}.get(reason, reason)
+        if self.homing and reason == "low_steps":
+            outcome = "out of steps"
+        elif not self.homing:
+            outcome = "not homing"
+        error = "n/a" if self.heading_error is None else f"{self.heading_error:+.1f} deg"
+        print(
+            f"check-in: {reason} ({outcome}, {self.homing_steps} homing decisions), "
+            f"heading error {error}"
+        )
         return Action.CHECKIN, 1
 
     def _centre_range(self) -> float:
@@ -314,22 +415,33 @@ class MapAgent(Agent):
         return self._turn(error, self.max_turn_ticks)
 
     def _turn(self, error: float, most: int = HOMING_TURN_TICKS) -> list[str]:
-        ticks = int(np.clip(round(abs(error) / self.turn_rate), 1, most))
+        rate = (self.localiser.turn_rate() if self.online_motion else None) or self.turn_rate
+        ticks = int(np.clip(round(abs(error) / rate), 1, most))
         return ["LEFT" if error > 0 else "RIGHT"] * ticks
 
     def _home(self, obs: Observation) -> list[str]:
         self.homing_steps += 1
         if self.homing_steps > self.homing_max:
-            self.checkin_reason = "homing_max"
-            return ["CHECKIN"]
+            if not self.fixes:
+                self.checkin_reason = "homing_max"
+                return ["CHECKIN"]
+            self.timed_out = True
+        if self.timed_out:
+            yaw = math.degrees(wrap(self.goal[2] - self.update.estimate.yaw))
+            if abs(yaw) < ESTIMATE_ALIGN_DEG:
+                self.checkin_reason = "homing_max"
+                return ["CHECKIN"]
+            return self._turn(yaw)
         yaw = self._yaw_to_view0(obs.image)
+        # Without a view the estimate alone aligns, to a tighter tolerance.
+        align_deg = self.align_deg if self.view or not self.fixes else ESTIMATE_ALIGN_DEG
         x, y = between(self.update.estimate[:3], self.goal)[:2]
         distance = math.hypot(x, y)
         if self.approaching:
             if distance > self.offset_m:
                 return self._approach(x, y)
             self.approaching = False
-        if abs(yaw) >= self.align_deg:
+        if abs(yaw) >= align_deg:
             return self._turn(yaw)
         if distance > self.offset_m:
             if abs(y) <= self.offset_m / 2:
@@ -352,8 +464,8 @@ class MapAgent(Agent):
 
     def _yaw_to_view0(self, image: np.ndarray) -> float:
         """Degrees to turn left to face view 0. The estimate gives it; the goal view the frame
-        matches best (SIFT, servo.py) overrides it, if within VIEW_GATE_DEG of the estimate's:
-        look-alikes match too."""
+        matches best (SIFT, servo.py, SERVO_MIN_MATCHES inliers) overrides it, if within
+        VIEW_GATE_DEG of the estimate's: look-alikes match too."""
         estimate = self.update.estimate
         error = math.degrees(wrap(self.goal[2] - estimate.yaw))
         current = self.servo.features(image)
@@ -412,6 +524,22 @@ if __name__ == "__main__":
     parser.add_argument("--align-deg", type=float, default=ALIGN_DEG)
     parser.add_argument("--offset-m", type=float, default=OFFSET_M)
     parser.add_argument("--homing-max", type=int, default=HOMING_MAX)
+    parser.add_argument("--floor-guard", action="store_true", help="wall guard from the floor")
+    parser.add_argument("--floor-guard-frac", type=float, default=FLOOR_GUARD_FRAC)
+    parser.add_argument("--blocked-zero", action="store_true", help="zero motion when blocked")
+    parser.add_argument("--blocked-diff", type=float, default=BLOCKED_DIFF)
+    parser.add_argument(
+        "--no-online-motion",
+        action="store_true",
+        help="calibrated fallback motion instead of the medians of this run's VO",
+    )
+    parser.add_argument("--fixes", action="store_true", help="the final alignment on")
+    parser.add_argument(
+        "--goal-camera",
+        choices=GOAL_CAMERAS,
+        default="auto",
+        help="camera the goal photos are read with; auto: photo (frame is explicit)",
+    )
     args = parser.parse_args()
 
     agent = MapAgent(
@@ -429,6 +557,13 @@ if __name__ == "__main__":
         align_deg=args.align_deg,
         offset_m=args.offset_m,
         homing_max=args.homing_max,
+        fixes=args.fixes,
+        goal_camera=args.goal_camera,
+        floor_guard=args.floor_guard,
+        floor_guard_frac=args.floor_guard_frac,
+        blocked_zero=args.blocked_zero,
+        blocked_diff=args.blocked_diff,
+        online_motion=not args.no_online_motion,
     )
     result = run(agent, cli.challenge(args), **cli.run_options(args))
     print(f"result: {result}")

@@ -58,6 +58,23 @@ HOLD_AGREE_M = 0.1
 HOLD_AGREE_DEG = 5.0
 HOLD_TICKS = 20
 """A held fix is dropped when no fix confirms it within this many ticks."""
+GREY_SIZE = (40, 30)
+"""``grey_difference`` compares frames downsampled to this (width, height)."""
+ONLINE_MIN = 20
+"""Successful visual odometry steps of an action before the online median replaces the
+calibrated motion."""
+CONTACT_ACTIONS = ("FORWARD", "BACKWARD")
+
+
+def grey_small(frame: np.ndarray) -> np.ndarray:
+    """``frame`` as a small grey image, for ``grey_difference``."""
+    grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return cv2.resize(grey, GREY_SIZE, interpolation=cv2.INTER_AREA).astype(np.float32)
+
+
+def grey_difference(a: np.ndarray, b: np.ndarray) -> float:
+    """Mean absolute grey difference of two ``grey_small`` images."""
+    return float(np.abs(a - b).mean())
 
 
 class Estimate(NamedTuple):
@@ -93,13 +110,28 @@ class Localiser:
         lost_ticks: int = LOST_TICKS,
         lost_sigma: float = LOST_SIGMA_M,
         layout_min: float = LAYOUT_MIN,
+        blocked_zero: float | None = None,
+        online_motion: bool = False,
     ) -> None:
         """``camera`` is the one the map was built with (the horizon shift included). ``motion``
-        is mapping.calibrate's result, calibrated over the map's exploration frames if None."""
+        is mapping.calibrate's result, calibrated over the map's exploration frames if None.
+        ``blocked_zero``: when visual odometry fails on a FORWARD / BACKWARD tick and the frame
+        differs from the previous one by under this (``grey_difference``), the step is zero, not
+        the calibrated motion. ``online_motion``: the fallback is the median of the run's own
+        successful visual odometry steps of the action, once it has ONLINE_MIN."""
         self.map, self.camera, self.floor = frozen_map, camera, floor
         self.motion = motion or mapping.calibrate(frozen_map.sift.routes, camera, floor)
         self.fix_every, self.lost_ticks, self.lost_sigma = fix_every, lost_ticks, lost_sigma
         self.layout_min = layout_min
+        self.blocked_zero, self.online_motion = blocked_zero, online_motion
+        self.samples: dict[str, list[tuple[float, float, float]]] = {}
+        """Successful visual odometry steps by action (kept always; used with online_motion)."""
+        self.grey: np.ndarray | None = None
+        self.grey_diff = math.nan
+        """The grey difference of the latest frame to the one before (NaN: none)."""
+        self.source: str | None = None
+        """How the latest step came: "vo", "calibrated", "online" or "zero" (None: no step)."""
+        self.zeroed = 0
         self.sift = cv2.SIFT_create()
         self.rng = np.random.default_rng(0)
         self.pose: mapping.Pose = (0.0, 0.0, 0.0)
@@ -121,6 +153,10 @@ class Localiser:
         """Advance one tick: ``frame`` is the image after ``action`` (a name from
         geometry.MOTION_ACTIONS, None for the first frame or no movement)."""
         view = wall_view(frame, self.camera, self.floor, self.sift)
+        grey = grey_small(frame)
+        self.grey_diff = math.nan if self.grey is None else grey_difference(self.grey, grey)
+        self.grey = grey
+        self.source = None
         self.ticks += 1
         self.since_fix += 1
         if self.previous is not None:
@@ -178,9 +214,19 @@ class Localiser:
         step = visual_odometry(previous, view, self.rng)
         if step is not None and not mapping.plausible(step):
             step = None
-        if step is None:
-            expected = self.motion.get(action) if action else None
-            step = (expected["dx"], expected["dy"], expected["dyaw"]) if expected else (0, 0, 0)
+        if step is not None:
+            self.source = "vo"
+            if action:
+                self.samples.setdefault(action, []).append(step)
+        elif (
+            self.blocked_zero is not None
+            and action in CONTACT_ACTIONS
+            and self.grey_diff < self.blocked_zero
+        ):
+            step, self.source = (0.0, 0.0, 0.0), "zero"
+            self.zeroed += 1
+        else:
+            step = self.fallback(action)
         x, y, yaw = compose(self.pose, step)
         manhattan, confidence = manhattan_yaw(view.points)
         if confidence >= MANHATTAN_CONFIDENCE:
@@ -189,6 +235,29 @@ class Localiser:
                 yaw = snapped
         self.pose = (x, y, yaw)
         self.sigma += DRIFT_M
+
+    def online(self, action: str) -> tuple[float, float, float] | None:
+        """The median of the successful visual odometry steps of ``action`` this run (each of
+        dx, dy, dyaw), None under ONLINE_MIN of them."""
+        steps = self.samples.get(action, [])
+        return (
+            tuple(float(v) for v in np.median(steps, axis=0)) if len(steps) >= ONLINE_MIN else None
+        )
+
+    def fallback(self, action: str | None) -> tuple[float, float, float]:
+        """The motion assumed for ``action`` when visual odometry fails (and sets ``source``)."""
+        if self.online_motion and action and (median := self.online(action)) is not None:
+            self.source = "online"
+            return median
+        self.source = "calibrated"
+        expected = self.motion.get(action) if action else None
+        return (expected["dx"], expected["dy"], expected["dyaw"]) if expected else (0, 0, 0)
+
+    def turn_rate(self) -> float | None:
+        """Degrees a LEFT or RIGHT tick turns, from the online medians (the mean of the two
+        absolute values, or of the one there is); None without either."""
+        turns = [abs(math.degrees(m[2])) for a in ("LEFT", "RIGHT") if (m := self.online(a))]
+        return float(np.mean(turns)) if turns else None
 
     def _fix(self, view) -> tuple[mapping.Pose, float] | None:
         """The absolute pose of ``view`` from the map and its layout score, or None: near the
