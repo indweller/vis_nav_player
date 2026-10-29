@@ -27,7 +27,7 @@ from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import cKDTree
 
 NODE_EVERY = 5
-LINK_M = 0.12
+LINK_M = 0.25
 TURN_COST = 0.05
 """Metres per radian of heading change."""
 LINK_INLIERS = 15

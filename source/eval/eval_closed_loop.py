@@ -35,21 +35,12 @@ in scores 0 points, tier "none". Per run also:
     (the segment's end points moved to the truth through the nearest mapped frame, as
     MapTruth.consistent does, but backwards).
 
-The defaults are the baseline steering; ``--arcs`` steers with arcs and ``--shortcut`` shortcuts
-every plan (``--corridor-m``). The arcs' motion is measured on the
-simulator (no noise, 50 ticks each) and printed; MapAgent uses it where the sum of the FORWARD and
-turn means is off by over 20%.
-
 --seeds N (default 3) drives each maze and goal with N motion seeds (the maze's plus
-MOTION_SEED_OFFSET, plus 1000 per extra). --configs names agent configurations to compare, each
-built on the last (CONFIGS: baseline = no alignment fixes; fixes = the goal photo camera and the
-final alignment; shortcut; arcs); none given, the agent is built from the flags. Per config the
-summary gives mean points +- std, the success rate (check-in within SUCCESS_M and SUCCESS_DEG of
-the goal), mean SPL (the simulator's) and the failure stage counts of the runs that failed (the
-first that applies: goal error > 0.2 m / localisation lost / homing timeout / heading > 20 deg /
-distance > 0.2 m).
-
-    uv run source/eval/eval_closed_loop.py --goals found --configs baseline,fixes,shortcut,arcs
+MOTION_SEED_OFFSET, plus 1000 per extra). The agent is built from MapAgent's flags
+(map_agent.Config). Per goal variant the summary gives mean points +- std, the success rate
+(check-in within SUCCESS_M and SUCCESS_DEG of the goal), mean SPL (the simulator's) and the
+failure stage counts of the runs that failed (the first that applies: goal error > 0.2 m /
+localisation lost / homing timeout / heading > 20 deg / distance > 0.2 m).
 
 Writes to results/eval/closed_loop/: runs.csv, ticks.csv and <seed>_<goal>.png (true walls, true
 trajectory in black, estimated in blue, goal true in green, map-true in blue and found in red,
@@ -76,7 +67,6 @@ from eval_planning import segment_hits_rects
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import map_agent  # noqa: E402
-import mapping  # noqa: E402
 from vis_nav_sdk import Action, Observation, run  # noqa: E402
 from vis_nav_sdk.local import local_session  # noqa: E402
 
@@ -95,12 +85,6 @@ SEED_STEP = 1000
 GOAL_ERROR_M = 0.2
 SUCCESS_M = 0.2
 SUCCESS_DEG = 20.0
-CONFIGS = {
-    "baseline": {"fixes": False, "goal_camera": "frame"},
-    "fixes": {"fixes": True},
-    "shortcut": {"fixes": True, "shortcut": True},
-    "arcs": {"fixes": True, "shortcut": True, "arcs": True},
-}
 STAGES = (
     "goal error",
     "localisation lost",
@@ -110,10 +94,6 @@ STAGES = (
 )
 BLOCKS = ("Distance", "Heading", "SPL")
 ACTIONS = ("FORWARD", "BACKWARD", "LEFT", "RIGHT", "FORWARD|LEFT", "FORWARD|RIGHT")
-ARC_SEEDS = (7, 8)
-ARC_TICKS = 50
-ARC_RUN = 5
-"""Ticks of an arc taken from one start."""
 FIELDS = [
     "config",
     "seed",
@@ -239,29 +219,6 @@ class Maze:
 
     def crosses_wall(self, a: np.ndarray, b: np.ndarray) -> bool:
         return segment_hits_rects(self.walls.rects, self.true_xy(a), self.true_xy(b))
-
-
-def measure_arcs() -> dict[str, dict]:
-    """The motion of one tick of FORWARD|LEFT and FORWARD|RIGHT in the robot's frame, on the
-    simulator without noise: the median over ARC_TICKS ticks of each, ARC_RUN at a time from the
-    spawns of ARC_SEEDS facing the four ways (the median is robust to a tick a wall blocks)."""
-    world = sim.Simulator(textures(), ARC_SEEDS[0])
-    steps: dict[str, list] = {"FORWARD|LEFT": [], "FORWARD|RIGHT": []}
-    starts = [(seed, k) for seed in ARC_SEEDS for k in range(4)]
-    for i in range(math.ceil(ARC_TICKS / ARC_RUN)):
-        seed, k = starts[i % len(starts)]
-        for name, turn in (("FORWARD|LEFT", sim.LEFT), ("FORWARD|RIGHT", sim.RIGHT)):
-            world.reset(seed)
-            if k:
-                world.step(sim.LEFT, round(k * 90.0 / map_agent.DEFAULT_TURN_DEG))
-            for _ in range(ARC_RUN):
-                before = world.pose()
-                world.step(sim.FORWARD | turn, 1)
-                steps[name].append(mapping.between(before, world.pose()))
-    return {
-        name: dict(zip(("dx", "dy", "dyaw"), np.median(s, axis=0).tolist(), strict=True))
-        for name, s in steps.items()
-    }
 
 
 def motion_seed(maze: Maze, motion: int) -> int:
@@ -503,11 +460,7 @@ def draw(maze: Maze, run_: dict, found: tuple, row: dict, path: Path) -> None:
 
 def evaluate(seed: int, args, out: Path) -> tuple[list[dict], list[dict]]:
     root = record(seed)
-    configs = args.configs or {"": {}}
-    agents = {
-        name: ServerFrames(root, **{**agent_options(args), **options})
-        for name, options in configs.items()
-    }
+    agents = {"": ServerFrames(root, config=map_agent.config_from(args))}
     first = next(iter(agents.values()))
     maze = Maze(seed, first, root)
     print(
@@ -553,27 +506,6 @@ def evaluate(seed: int, args, out: Path) -> tuple[list[dict], list[dict]]:
             label = f"{seed}_{row['goal']}" + (f"_{row['config']}" if row["config"] else "")
             draw(maze, runs[row["config"], row["goal"]], found, row, out / f"{label}.png")
     return rows, ticks
-
-
-def agent_options(args) -> dict:
-    return {
-        "lookahead_m": args.lookahead_m,
-        "turn_tol": args.turn_tol,
-        "arc_deg": args.arc_deg,
-        "arcs": args.arcs,
-        "max_turn_ticks": args.max_turn_ticks,
-        "shortcut": args.shortcut,
-        "corridor_m": args.corridor_m,
-        "arc_measured": args.arc_measured,
-        "forward_ticks": args.forward_ticks,
-        "guard_m": args.guard_m,
-        "near_m": args.near_m,
-        "align_deg": args.align_deg,
-        "offset_m": args.offset_m,
-        "homing_max": args.homing_max,
-        "fixes": not args.no_fixes,
-        "goal_camera": "photo",
-    }
 
 
 def failure_stage(row: dict) -> str | None:
@@ -702,35 +634,14 @@ def main() -> None:
     p.add_argument("--mazes", default="7,8,9,10,11,12", help="comma-separated maze seeds")
     p.add_argument("--goals", default=",".join(GOALS), help="found, true or both")
     p.add_argument("--seeds", type=int, default=SEEDS, help="motion seeds per maze and goal")
-    p.add_argument(
-        "--configs", default="", help=f"comma-separated agent configs to compare: {list(CONFIGS)}"
-    )
     p.add_argument("--out-dir", default="results/eval", help="where closed_loop/ goes")
     p.add_argument("--max-steps", type=int, default=MAX_STEPS, help="the session's step budget")
     p.add_argument("--no-sdk", action="store_true", help="skip the SDK scorer's second run")
-    p.add_argument("--lookahead-m", type=float, default=map_agent.LOOKAHEAD_M)
-    p.add_argument("--turn-tol", type=float, default=map_agent.TURN_TOL_DEG)
-    p.add_argument("--arc-deg", type=float, default=map_agent.ARC_DEG)
-    p.add_argument("--arcs", action="store_true", help="steer with FORWARD+turn arcs")
-    p.add_argument("--max-turn-ticks", type=int, default=None)
-    p.add_argument("--shortcut", action="store_true", help="string-pull every plan")
-    p.add_argument("--corridor-m", type=float, default=map_agent.planner_module.CORRIDOR_M)
-    p.add_argument("--forward-ticks", type=int, default=map_agent.FORWARD_TICKS)
-    p.add_argument("--guard-m", type=float, default=map_agent.GUARD_M)
-    p.add_argument("--near-m", type=float, default=map_agent.NEAR_M)
-    p.add_argument("--align-deg", type=float, default=map_agent.ALIGN_DEG)
-    p.add_argument("--offset-m", type=float, default=map_agent.OFFSET_M)
-    p.add_argument("--homing-max", type=int, default=map_agent.HOMING_MAX)
-    p.add_argument("--no-fixes", action="store_true", help="the goal camera and alignment off")
+    map_agent.add_config_arguments(p)
     args = p.parse_args()
     args.goals = [g for g in args.goals.split(",") if g]
-    args.configs = {name: CONFIGS[name] for name in args.configs.split(",") if name}
 
     stored_floor()
-    args.arc_measured = measure_arcs()
-    print("measured arc motion (sim, no noise, per tick):")
-    for name, m in args.arc_measured.items():
-        print(f"  {name:<14} dx {m['dx']:.4f} dy {m['dy']:.4f} dyaw {m['dyaw']:.4f}")
     out = Path(args.out_dir) / "closed_loop"
     rows: list[dict] = []
     ticks: list[dict] = []

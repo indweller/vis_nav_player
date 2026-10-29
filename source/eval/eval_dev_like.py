@@ -2,11 +2,10 @@
 vis_nav_sim allows: MapAgent through the SDK's run() path, ten goals in one 31x31 maze.
 
     uv run source/eval/eval_dev_like.py
-    uv run source/eval/eval_dev_like.py --seed 102 --goals 4 --agent-args "--no-fixes"
+    uv run source/eval/eval_dev_like.py --seed 102 --goals 4 --agent-args "--align-deg 6"
     uv run source/eval/eval_dev_like.py --seed 301 --maze-size 51 --routes 3
 
-MapAgent's flags are --agent-args, by default "" (MapAgent's own defaults: fixes, online
-motion, goal camera "auto").
+MapAgent's flags are --agent-args, by default "" (MapAgent's own defaults, map_agent.Config).
 
 Environment: a 31x31 maze of 0.2 m cells (Simulator rows / cols), msaa 4, camera 320x240 with
 fx 92, cx 160, cy 120 (asserted), a 10,000 step budget and the SDK's default motion noise. The
@@ -67,7 +66,7 @@ import cv2
 import numpy as np
 import vis_nav_sim as sim
 from common import cell_centre, cell_of, fmt, geodesic, textures, write_csv
-from eval_closed_loop import ServerFrames, longest_stall, measure_arcs, spread
+from eval_closed_loop import ServerFrames, longest_stall, spread
 from eval_cues import Walls, stored_floor
 from eval_geometry import Frame
 from eval_goal_photos import range_difference
@@ -163,8 +162,6 @@ FIELDS = [
     "fixes_layout_failed",
     "lost_events",
     "wall_guard_events",
-    "floor_guard_events",
-    "blocked_zero_ticks",
     "online_fallback_ticks",
     "online_forward_dx_m",
     "online_backward_dx_m",
@@ -214,7 +211,6 @@ TICK_FIELDS = [
     "mode",
     "action",
     "guard",
-    "guard_cause",
     "path_id",
     "estw_x",
     "estw_y",
@@ -225,7 +221,6 @@ TICK_FIELDS = [
     "vo_fallback",
     "vo_source",
     "grey_diff",
-    "floor_frac",
     "blocked",
     "geodesic",
 ]
@@ -650,7 +645,6 @@ class DevAgent(ServerFrames):
                 "taken": taken,
                 "applied": applied,
                 "guard": self.guarded,
-                "guard_cause": self.guard_cause,
                 "path": self.update.path,
                 "status": estimate.status,
                 "rejected": estimate.rejected,
@@ -658,7 +652,6 @@ class DevAgent(ServerFrames):
                 "vo_fallback": VO["fallback"] if VO["called"] else None,
                 "vo_source": self.localiser.source,
                 "grey_diff": self.localiser.grey_diff,
-                "floor_frac": self.floor_frac,
                 "blocked": blocked,
                 "geodesic": float(self.geodesic[cell_of(maze.world, maze.free, *pose[:2])]),
             }
@@ -674,58 +667,12 @@ class DevAgent(ServerFrames):
 def agent_parser() -> argparse.ArgumentParser:
     """MapAgent's own command-line flags (map_agent.py's __main__), for --agent-args."""
     p = argparse.ArgumentParser(prog="--agent-args", add_help=False)
-    p.add_argument("--lookahead-m", type=float, default=map_agent.LOOKAHEAD_M)
-    p.add_argument("--turn-tol", type=float, default=map_agent.TURN_TOL_DEG)
-    p.add_argument("--arc-deg", type=float, default=map_agent.ARC_DEG)
-    p.add_argument("--arcs", action="store_true")
-    p.add_argument("--max-turn-ticks", type=int, default=None)
-    p.add_argument("--shortcut", action="store_true")
-    p.add_argument("--corridor-m", type=float, default=map_agent.planner_module.CORRIDOR_M)
-    p.add_argument("--link-m", type=float, default=map_agent.planner_module.LINK_M)
-    p.add_argument("--forward-ticks", type=int, default=map_agent.FORWARD_TICKS)
-    p.add_argument("--guard-m", type=float, default=map_agent.GUARD_M)
-    p.add_argument("--near-m", type=float, default=map_agent.NEAR_M)
-    p.add_argument("--align-deg", type=float, default=map_agent.ALIGN_DEG)
-    p.add_argument("--offset-m", type=float, default=map_agent.OFFSET_M)
-    p.add_argument("--homing-max", type=int, default=map_agent.HOMING_MAX)
-    p.add_argument("--no-fixes", action="store_true")
-    p.add_argument("--align-source", choices=map_agent.ALIGN_SOURCES, default="estimate")
-    p.add_argument("--goal-camera", choices=map_agent.GOAL_CAMERAS, default="auto")
-    p.add_argument("--floor-guard", action="store_true")
-    p.add_argument("--floor-guard-frac", type=float, default=map_agent.FLOOR_GUARD_FRAC)
-    p.add_argument("--blocked-zero", action="store_true")
-    p.add_argument("--blocked-diff", type=float, default=map_agent.BLOCKED_DIFF)
-    p.add_argument("--no-online-motion", action="store_true")
+    map_agent.add_config_arguments(p)
     return p
 
 
-def agent_options(text: str) -> dict:
-    a = agent_parser().parse_args(text.split())
-    return {
-        "lookahead_m": a.lookahead_m,
-        "turn_tol": a.turn_tol,
-        "arc_deg": a.arc_deg,
-        "arcs": a.arcs,
-        "max_turn_ticks": a.max_turn_ticks,
-        "shortcut": a.shortcut,
-        "corridor_m": a.corridor_m,
-        "link_m": a.link_m,
-        "arc_measured": measure_arcs() if a.arcs else None,
-        "forward_ticks": a.forward_ticks,
-        "guard_m": a.guard_m,
-        "near_m": a.near_m,
-        "align_deg": a.align_deg,
-        "offset_m": a.offset_m,
-        "homing_max": a.homing_max,
-        "fixes": not a.no_fixes,
-        "align_source": a.align_source,
-        "goal_camera": a.goal_camera,
-        "floor_guard": a.floor_guard,
-        "floor_guard_frac": a.floor_guard_frac,
-        "blocked_zero": a.blocked_zero,
-        "blocked_diff": a.blocked_diff,
-        "online_motion": not a.no_online_motion,
-    }
+def agent_config(text: str) -> map_agent.Config:
+    return map_agent.config_from(agent_parser().parse_args(text.split()))
 
 
 # -- one run
@@ -893,8 +840,6 @@ def score_run(agent: DevAgent, goal: Goal, repeat: int, result, session, args) -
         "fixes_layout_failed": counts["layout"],
         "lost_events": agent.localiser.lost_events,
         "wall_guard_events": agent.guard_events,
-        "floor_guard_events": agent.floor_guard_events,
-        "blocked_zero_ticks": agent.localiser.zeroed,
         "online_fallback_ticks": sum(t["vo_source"] == "online" for t in log),
         **online_values(agent.localiser),
         "wall_contact_ticks": sum(t["blocked"] for t in log),
@@ -936,7 +881,6 @@ def score_run(agent: DevAgent, goal: Goal, repeat: int, result, session, args) -
                 "mode": t["mode"],
                 "action": t["action"],
                 "guard": int(t["guard"]),
-                "guard_cause": t["guard_cause"] or "",
                 "path_id": plan_ids.get(id(t["path"]), -1),
                 **dict(zip(("estw_x", "estw_y", "estw_yaw"), estw, strict=True)),
                 "fix": t["status"] or "",
@@ -945,7 +889,6 @@ def score_run(agent: DevAgent, goal: Goal, repeat: int, result, session, args) -
                 "vo_fallback": "" if t["vo_fallback"] is None else int(t["vo_fallback"]),
                 "vo_source": t["vo_source"] or "",
                 "grey_diff": t["grey_diff"],
-                "floor_frac": t["floor_frac"],
                 "blocked": int(t["blocked"]),
                 "geodesic": t["geodesic"],
             }
@@ -1247,7 +1190,7 @@ def main() -> None:
         frozen_map.get(root, dict(geometry.CAMERA), floor, rebuild=True)
     localiser_module.visual_odometry = counted_visual_odometry
     factory = SessionFactory()
-    agent = DevAgent(root, **agent_options(args.agent_args))
+    agent = DevAgent(root, config=agent_config(args.agent_args))
     agent.factory = factory
     agent.maze = Truth(world, agent, truth)
     agent.encode = world.jpeg

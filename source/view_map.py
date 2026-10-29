@@ -110,7 +110,7 @@ def draw(ax, store, spawn: Pose, goal: Pose | None, paths: list[tuple[object, st
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", required=True, help="exploration data directory")
-    parser.add_argument("--goal-camera", choices=map_agent.GOAL_CAMERAS, default="auto")
+    parser.add_argument("--goal-camera", choices=("auto", "frame", "photo"), default="auto")
     parser.add_argument(
         "--goal",
         type=parse_pose,

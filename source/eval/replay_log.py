@@ -47,7 +47,9 @@ from goal import find_goal, target_camera  # noqa: E402
 from localiser import Localiser, grey_difference, grey_small  # noqa: E402
 from mapping import between, compose, wrap  # noqa: E402
 
-BLOCKED_DIFF = map_agent.BLOCKED_DIFF
+BLOCKED_DIFF = 17.3
+"""--blocked-zero: the grey difference (localiser.grey_difference) under which a failed-VO
+FORWARD / BACKWARD tick is taken as blocked (fitted on a dev-like run, F1 0.97)."""
 from view_map import draw as draw_map  # noqa: E402
 
 matplotlib.use("Agg")
@@ -140,25 +142,25 @@ def contacts(rows, threshold: float) -> list[int]:
 
 def steps_for(path, motion: dict, turn_deg: float) -> tuple[int, int, int]:
     """(FORWARD ticks, turn ticks, total) a MapAgent-like driver takes along ``path``, simulated
-    without noise: heading toward the point LOOKAHEAD_M ahead on the path, a turn of up to
-    MAX_TURN_TICKS ticks when the error is over TURN_TOL_DEG, else FORWARD_TICKS FORWARD ticks;
-    then the turn to the goal's yaw."""
+    without noise (map_agent.Config's defaults): heading toward the point lookahead_m ahead on the
+    path, a turn of up to max_turn_ticks ticks when the error is over turn_tol, else
+    forward_ticks FORWARD ticks; then the turn to the goal's yaw."""
     step = abs(motion["FORWARD"]["dx"])
     pose = [float(v) for v in path.waypoints[0]]
     forward = turns = progress = 0.0
     for _ in range(20000):
-        if path.length - progress < map_agent.OFFSET_M:
+        if path.length - progress < map_agent.Config.offset_m:
             break
         a = path.arc
-        i = int(np.searchsorted(a, min(progress + map_agent.LOOKAHEAD_M, path.length)))
+        i = int(np.searchsorted(a, min(progress + map_agent.Config.lookahead_m, path.length)))
         target = np.array(path.waypoints[min(i, len(a) - 1), :2])
         error = math.degrees(wrap(math.atan2(target[1] - pose[1], target[0] - pose[0]) - pose[2]))
-        if abs(error) > map_agent.TURN_TOL_DEG:
-            n = int(np.clip(round(abs(error) / turn_deg), 1, map_agent.MAX_TURN_TICKS))
+        if abs(error) > map_agent.Config.turn_tol:
+            n = int(np.clip(round(abs(error) / turn_deg), 1, map_agent.Config.max_turn_ticks))
             pose[2] = wrap(pose[2] + math.copysign(n * math.radians(turn_deg), error))
             turns += n
         else:
-            for _ in range(map_agent.FORWARD_TICKS):
+            for _ in range(map_agent.Config.forward_ticks):
                 pose[0] += step * math.cos(pose[2])
                 pose[1] += step * math.sin(pose[2])
                 forward += 1

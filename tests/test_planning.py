@@ -152,8 +152,8 @@ def test_links_through_a_wall_are_dropped():
     left, right = line((0, 0), (0, 0.9), 10), line((0.1, 0), (0.1, 0.9), 10)
     frozen = SimpleNamespace(poses=[left, right], grid=grid_with_wall_at(0.05))
     open_ = SimpleNamespace(poses=[left, right], grid=grid_with_wall_at(0.5))
-    walled = PlaceGraph(frozen, min_inliers=0)
-    free = PlaceGraph(open_, min_inliers=0)
+    walled = PlaceGraph(frozen, link_m=0.12, min_inliers=0)
+    free = PlaceGraph(open_, link_m=0.12, min_inliers=0)
     assert walled.link_counts["candidates"] == free.link_counts["candidates"] > 0
     assert walled.link_counts["after_walls"] == 0
     assert free.link_counts["after_walls"] == free.link_counts["candidates"]
