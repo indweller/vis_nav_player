@@ -100,10 +100,10 @@ def test_arc_motion_sums_the_means_unless_the_measure_differs():
     assert off["FORWARD|LEFT"] > 0.2
 
 
-def test_defaults_online_motion_on_fixes_off():
+def test_defaults_online_motion_and_fixes_on():
     defaults = inspect.signature(MapAgent.__init__).parameters
     assert defaults["online_motion"].default is True
-    assert defaults["fixes"].default is False
+    assert defaults["fixes"].default is True
 
 
 def test_steering_bands():
@@ -134,6 +134,7 @@ def _homing_agent(fixes: bool = True, steps: int = 0, view=None):
     """A MapAgent with the state ``_home`` reads, the goal at the origin facing 0."""
     agent = MapAgent.__new__(MapAgent)
     agent.fixes, agent.homing_max, agent.homing_steps = fixes, 60, steps
+    agent.align_source = "view"
     agent.align_deg, agent.offset_m, agent.turn_tol, agent.turn_rate = 8.0, 0.05, 12.0, 3.4375
     agent.online_motion = False
     agent.approaching, agent.timed_out, agent.view = False, False, view
@@ -168,3 +169,37 @@ def test_estimate_alignment_is_tighter_than_the_view_alignment():
     agent._yaw_to_view0 = lambda image: 6.0
     agent.view = (0, 6.0)  # a matched view: 6 degrees is under the 8 degree tolerance
     assert agent._home(SimpleNamespace(image=None)) == ["CHECKIN"]
+
+
+def test_test_local_never_reaches_the_session(tiny_maze, monkeypatch, capsys):
+    import map_agent
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("the SDK's session code was reached")
+
+    monkeypatch.setattr(map_agent, "run", refuse)
+    monkeypatch.setattr(map_agent.MapAgent, "setup", refuse)
+    monkeypatch.setattr(map_agent.cli, "challenge", refuse)
+    monkeypatch.setattr(map_agent.cli, "run_options", refuse)
+    map_agent.main(["--test-local", "--data", str(tiny_maze)])
+    out = capsys.readouterr().out
+    for stage in ("map load/build", "motion calibration", "planner", "find_goal"):
+        assert stage in out
+    assert "frames per route:" in out and "goal pose:" in out and "motion per action" in out
+
+
+def test_defaults_align_deg_8_and_estimate_source():
+    defaults = inspect.signature(MapAgent.__init__).parameters
+    assert defaults["align_deg"].default == 8.0
+    assert defaults["align_source"].default == "estimate"
+
+
+def test_align_source_view_follows_the_view_yaw_and_estimate_ignores_it():
+    agent = _homing_agent(view=(0, 0.0))
+    agent._yaw_to_view0 = lambda image: 0.0  # the view says aligned; the estimate is 20 deg off
+    agent.align_source = "view"
+    assert agent._home(SimpleNamespace(image=None)) == ["CHECKIN"]
+    agent = _homing_agent(view=(0, 0.0))
+    agent._yaw_to_view0 = lambda image: 0.0
+    agent.align_source = "estimate"
+    assert agent._home(SimpleNamespace(image=None))[0] == "LEFT"

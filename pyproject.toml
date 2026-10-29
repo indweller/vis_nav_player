@@ -57,7 +57,11 @@ torch = [
 #                             Windows or Linux (macOS falls back to PyPI)
 #   uv sync --group rl-cpu    the same with the CPU build everywhere: the small download
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = [
+    "matplotlib>=3.10.9",
+    "pytest>=8",
+    "ruff>=0.6",
+]
 local = ["vis-nav-sim>=0.1.0"]
 rl = [{ include-group = "local" }, "gymnasium>=1.0", "skrl[torch]>=2.1"]
 rl-cpu = [{ include-group = "rl" }, "torch>=2.4"]

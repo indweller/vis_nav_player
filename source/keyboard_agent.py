@@ -45,4 +45,6 @@ class KeyboardAgent(Agent):
 
 if __name__ == "__main__":
     args = cli.parser(__doc__).parse_args()
+    if args.no_viewer:
+        raise SystemExit("keyboard_agent needs the viewer window to read keys; drop --no-viewer")
     run(KeyboardAgent(), cli.challenge(args), **cli.run_options(args))

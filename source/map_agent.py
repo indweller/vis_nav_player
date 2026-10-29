@@ -32,30 +32,35 @@ the localiser sees every frame:
     tries a fix every tick against the mapped frames within 0.5 m of the goal (its SIFT and layout
     checks). The target is the goal pose. The frame is matched against the four goal views by
     SIFT (servo.py) to find which view it is looking at and so the yaw to view 0 (the estimate's
-    when none matches; the views match only within about 0.1 m of the goal). Turn until that is
-    under --align-deg; then, if the estimate is over --offset-m from the goal, step toward it, a
-    tick at a time (along the heading if it is off that way only; else turn to it and drive,
-    aligning again once there); CHECKIN when aligned and within --offset-m.
-    With --fixes (off by default): the goal view overrides the estimate's yaw only with at least
+    when none matches; the views match only within about 0.1 m of the goal). By default
+    (--align-source estimate) the turn is the estimate's yaw error alone: the view match is still
+    computed (and kept in ``view``) but does not set it; --align-source view lets a matched view
+    set it. Turn until that is under --align-deg; then, if the estimate is over --offset-m from
+    the goal, step toward it, a tick at a time (along the heading if it is off that way only; else
+    turn to it and drive, aligning again once there); CHECKIN when aligned and within --offset-m.
+    Unless --no-fixes: the goal view overrides the estimate's yaw only with at least
     15 inliers (else 8) and within 30 degrees of it. Without a match the estimate's yaw (against
     the goal's from find_goal) must be under 5 degrees. After --homing-max homing decisions the
     agent turns by the estimate alone to that yaw error and then checks in, wherever it is;
-    without --fixes it checks in at once.
+    with --no-fixes it checks in at once.
   - CHECKIN when fewer than 5 steps are left (the only check-in before alignment).
   - At check-in the homing outcome and the heading error (the estimate's, against the goal's yaw)
     are printed.
 
     uv run source/map_agent.py --local 7
     uv run source/map_agent.py --challenge <id>
+    uv run source/map_agent.py --test-local --data data/<id>   # offline check, no session
 """
 
 from __future__ import annotations
 
 import json
 import math
+import time
 from pathlib import Path
 
 import cli
+import cv2
 import frozen_map
 import geometry
 import mapping
@@ -95,6 +100,7 @@ BLOCKED_DIFF = 17.3
 FORWARD / BACKWARD tick is taken as blocked (fitted on a dev-like run, F1 0.97)."""
 NEAR_M = 0.15
 ALIGN_DEG = 8.0
+ALIGN_SOURCES = ("estimate", "view")
 OFFSET_M = 0.05
 HOMING_MAX = 60
 VIEW_GATE_DEG = 30.0
@@ -102,13 +108,15 @@ VIEW_GATE_DEG = 30.0
 ESTIMATE_ALIGN_DEG = 5.0
 """Without a goal view match, the estimate's yaw error must be under this to check in."""
 LEGACY_MIN_MATCHES = 8
-"""SERVO_MIN_MATCHES before the alignment fixes (``fixes=False``)."""
+"""SERVO_MIN_MATCHES before the alignment fixes (``fixes=False``, i.e. --no-fixes)."""
 SERVO_MIN_MATCHES = 15
 """Inliers the servo needs between the frame and a goal view (the views match only near)."""
 LOW_STEPS = 5
 """CHECKIN when fewer steps than this are left."""
 
 GOAL_CAMERAS = ("auto", "frame", "photo")
+GOAL_VIEW_PX = 320
+"""Width of each of the four goal views split from target.jpg."""
 
 Pose = tuple[float, float, float]
 
@@ -159,6 +167,7 @@ class MapAgent(Agent):
         max_turn_ticks: int | None = None,
         shortcut: bool = False,
         corridor_m: float = planner_module.CORRIDOR_M,
+        link_m: float = planner_module.LINK_M,
         arc_measured: dict[str, dict] | None = None,
         forward_ticks: int = FORWARD_TICKS,
         guard_m: float = GUARD_M,
@@ -166,7 +175,8 @@ class MapAgent(Agent):
         align_deg: float = ALIGN_DEG,
         offset_m: float = OFFSET_M,
         homing_max: int = HOMING_MAX,
-        fixes: bool = False,
+        fixes: bool = True,
+        align_source: str = "estimate",
         goal_camera: str = "auto",
         floor_guard: bool = False,
         floor_guard_frac: float = FLOOR_GUARD_FRAC,
@@ -177,9 +187,12 @@ class MapAgent(Agent):
         """``goal_override``: a goal pose in the map frame, used instead of ``find_goal``.
         ``arcs``: steer with arcs; ``max_turn_ticks`` is then ARC_MAX_TURN_TICKS unless given.
         ``shortcut``: shortcut every plan, within ``corridor_m`` of the mapped frames.
+        ``link_m``: the planner's link radius (metres) between mapped poses.
         ``arc_measured``: measured arc motion for ``arc_motion``.
-        ``fixes``: True turns the final alignment on (the 5 degree estimate alignment, the 15
-        inlier view gate, the turn after a homing timeout); off by default.
+        ``fixes``: True (the default) turns the final alignment on (the 5 degree estimate
+        alignment, the 15 inlier view gate, the turn after a homing timeout).
+        ``align_source``: "estimate" (the default) turns by the estimate's yaw error only (the
+        view is still matched and logged); "view" turns by the goal view's yaw when one matches.
         ``goal_camera``: the camera the goal photos are read with: "frame" (the exploration
         frames' own camera), "photo" (the lower goal.TARGET_CAMERA_HEIGHT camera, which
         targets() renders with), or "auto": "photo", on local and server challenges alike.
@@ -203,6 +216,9 @@ class MapAgent(Agent):
         self.corridor_m = corridor_m if shortcut else None
         self.guard_m, self.near_m, self.align_deg = guard_m, near_m, align_deg
         self.offset_m, self.homing_max, self.fixes = offset_m, homing_max, fixes
+        if align_source not in ALIGN_SOURCES:
+            raise ValueError(f"align_source {align_source!r} not in {ALIGN_SOURCES}")
+        self.align_source = align_source
 
         self.floor = FloorMask.load(FLOOR_MASK_PATH)
         routes = mapping.load_routes(self.root)
@@ -213,9 +229,19 @@ class MapAgent(Agent):
         self.camera = Camera(
             {**self.camera_dict, "cy": self.camera_dict["cy"] + mapping.HORIZON_SHIFT_PX}
         )
+        self.timings: dict[str, float] = {}
+        """Seconds of each construction stage: map, motion, planner."""
+        t = time.perf_counter()
         self.store, self.routes = frozen_map.get(self.root, self.camera_dict, self.floor)
+        self.timings["map load/build"] = time.perf_counter() - t
+        t = time.perf_counter()
         self.motion = load_motion(self.root, self.routes, self.camera, self.floor)
-        self.planner = planner_module.PlaceGraph(self.store, cache_path=self.root / "links.npz")
+        self.timings["motion calibration"] = time.perf_counter() - t
+        t = time.perf_counter()
+        self.planner = planner_module.PlaceGraph(
+            self.store, link_m=link_m, cache_path=self.root / "links.npz"
+        )
+        self.timings["planner"] = time.perf_counter() - t
         turns = [
             abs(math.degrees(self.motion[a]["dyaw"])) for a in ("LEFT", "RIGHT") if a in self.motion
         ]
@@ -433,7 +459,9 @@ class MapAgent(Agent):
                 return ["CHECKIN"]
             return self._turn(yaw)
         yaw = self._yaw_to_view0(obs.image)
-        # Without a view the estimate alone aligns, to a tighter tolerance.
+        if self.align_source == "estimate":
+            yaw = math.degrees(wrap(self.goal[2] - self.update.estimate.yaw))
+        # Without a view the estimate alone aligns, to ESTIMATE_ALIGN_DEG.
         align_deg = self.align_deg if self.view or not self.fixes else ESTIMATE_ALIGN_DEG
         x, y = between(self.update.estimate[:3], self.goal)[:2]
         distance = math.hypot(x, y)
@@ -503,8 +531,90 @@ class MapAgent(Agent):
         ]
 
 
-if __name__ == "__main__":
+def local_data_dir(args) -> Path:
+    """The exploration data for ``--test-local``, never downloaded: ``--data``, else
+    ``data/<challenge>`` (or the local maze, recorded offline on first use)."""
+    if args.data:
+        return Path(args.data)
+    if args.local is not None:
+        return cli.exploration_data(args, None)
+    path = cli.ROOT / "data" / str(args.challenge)
+    if not args.challenge or not (path / "target.jpg").exists():
+        raise SystemExit(f"--test-local needs --data, or downloaded data in {path}")
+    return path
+
+
+def goal_views(root: Path) -> list[np.ndarray]:
+    """The four goal views of ``root/target.jpg`` (side by side), GOAL_VIEW_PX wide each."""
+    target = cv2.imread(str(root / "target.jpg"))
+    if target is None:
+        raise SystemExit(f"cannot read {root / 'target.jpg'}")
+    width = target.shape[1] // 4
+    views = [target[:, k * width : (k + 1) * width] for k in range(4)]
+    views = [
+        cv2.resize(v, (GOAL_VIEW_PX, v.shape[0])) if v.shape[1] != GOAL_VIEW_PX else v
+        for v in views
+    ]
+    return views
+
+
+def report_local(agent: MapAgent, root: Path) -> None:
+    """Print what ``MapAgent`` built and what ``find_goal`` makes of ``root/target.jpg`` (four
+    views side by side), touching no server and creating no session."""
+    views = goal_views(root)
+    mode = "photo" if agent.goal_camera == "auto" else agent.goal_camera
+    t = time.perf_counter()
+    found = find_goal(views, agent.store, agent.camera, agent.floor, photographed=mode == "photo")
+    timings = {**agent.timings, "find_goal": time.perf_counter() - t}
+    print("stage wall time:")
+    for name, seconds in timings.items():
+        print(f"  {name}: {seconds:.2f} s")
+    print("motion per action (dx m, dy m, dyaw deg):")
+    for name, m in agent.motion.items():
+        print(f"  {name}: {m['dx']:.4f} {m['dy']:.4f} {math.degrees(m['dyaw']):.3f}")
+    print("frames per route: " + ", ".join(str(len(r.frames)) for r in agent.routes))
+    pose = (
+        "none"
+        if found is None
+        else f"({found.x:.2f}, {found.y:.2f}) {math.degrees(found.yaw):.0f} deg"
+    )
+    print(f"goal camera: {mode}; goal pose: {pose}")
+
+
+def agent_options(args) -> dict:
+    return {
+        "lookahead_m": args.lookahead_m,
+        "turn_tol": args.turn_tol,
+        "arc_deg": args.arc_deg,
+        "arcs": args.arcs,
+        "max_turn_ticks": args.max_turn_ticks,
+        "shortcut": args.shortcut,
+        "corridor_m": args.corridor_m,
+        "link_m": args.link_m,
+        "forward_ticks": args.forward_ticks,
+        "guard_m": args.guard_m,
+        "near_m": args.near_m,
+        "align_deg": args.align_deg,
+        "offset_m": args.offset_m,
+        "homing_max": args.homing_max,
+        "fixes": not args.no_fixes,
+        "align_source": args.align_source,
+        "goal_camera": args.goal_camera,
+        "floor_guard": args.floor_guard,
+        "floor_guard_frac": args.floor_guard_frac,
+        "blocked_zero": args.blocked_zero,
+        "blocked_diff": args.blocked_diff,
+        "online_motion": not args.no_online_motion,
+    }
+
+
+def main(argv: list[str] | None = None) -> None:
     parser = cli.parser(__doc__)
+    parser.add_argument(
+        "--test-local",
+        action="store_true",
+        help="build or load everything offline, print timings, and exit before any server call",
+    )
     parser.add_argument("--data", default=None, help="exploration data directory")
     parser.add_argument("--lookahead-m", type=float, default=LOOKAHEAD_M)
     parser.add_argument("--turn-tol", type=float, default=TURN_TOL_DEG, help="degrees")
@@ -518,6 +628,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--shortcut", action="store_true", help="string-pull every plan")
     parser.add_argument("--corridor-m", type=float, default=planner_module.CORRIDOR_M)
+    parser.add_argument("--link-m", type=float, default=planner_module.LINK_M)
     parser.add_argument("--forward-ticks", type=int, default=FORWARD_TICKS)
     parser.add_argument("--guard-m", type=float, default=GUARD_M)
     parser.add_argument("--near-m", type=float, default=NEAR_M)
@@ -533,37 +644,31 @@ if __name__ == "__main__":
         action="store_true",
         help="calibrated fallback motion instead of the medians of this run's VO",
     )
-    parser.add_argument("--fixes", action="store_true", help="the final alignment on")
+    parser.add_argument(
+        "--align-source",
+        choices=ALIGN_SOURCES,
+        default="estimate",
+        help="yaw homing turns by: the estimate's error (the view is still matched and logged), "
+        "or the matched goal view's",
+    )
+    parser.add_argument("--no-fixes", action="store_true", help="the final alignment off")
     parser.add_argument(
         "--goal-camera",
         choices=GOAL_CAMERAS,
         default="auto",
         help="camera the goal photos are read with; auto: photo (frame is explicit)",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.test_local:
+        root = local_data_dir(args)
+        report_local(MapAgent(root, **agent_options(args)), root)
+        return
 
-    agent = MapAgent(
-        cli.exploration_data(args, args.data),
-        lookahead_m=args.lookahead_m,
-        turn_tol=args.turn_tol,
-        arc_deg=args.arc_deg,
-        arcs=args.arcs,
-        max_turn_ticks=args.max_turn_ticks,
-        shortcut=args.shortcut,
-        corridor_m=args.corridor_m,
-        forward_ticks=args.forward_ticks,
-        guard_m=args.guard_m,
-        near_m=args.near_m,
-        align_deg=args.align_deg,
-        offset_m=args.offset_m,
-        homing_max=args.homing_max,
-        fixes=args.fixes,
-        goal_camera=args.goal_camera,
-        floor_guard=args.floor_guard,
-        floor_guard_frac=args.floor_guard_frac,
-        blocked_zero=args.blocked_zero,
-        blocked_diff=args.blocked_diff,
-        online_motion=not args.no_online_motion,
-    )
+    root = cli.exploration_data(args, args.data)
+    agent = MapAgent(root, **agent_options(args))
     result = run(agent, cli.challenge(args), **cli.run_options(args))
     print(f"result: {result}")
+
+
+if __name__ == "__main__":
+    main()

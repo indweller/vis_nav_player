@@ -59,6 +59,7 @@ def parser(description: str) -> argparse.ArgumentParser:
         "--no-browser", action="store_true", help="do not open the run's page on the site"
     )
     p.add_argument("--no-check", action="store_true", help="skip the pre-flight check")
+    p.add_argument("--no-viewer", action="store_true", help="run without the live viewer window")
     return p
 
 
@@ -75,7 +76,7 @@ def run_options(args: argparse.Namespace) -> dict:
     return {
         "api_key": args.api_key,
         "server": args.server,
-        "viewer": True,
+        "viewer": not args.no_viewer,
         "check": not args.no_check,
         "confirm": False if args.yes else None,
         "browser": False if args.no_browser else None,

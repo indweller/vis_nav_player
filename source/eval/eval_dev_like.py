@@ -2,9 +2,10 @@
 vis_nav_sim allows: MapAgent through the SDK's run() path, ten goals in one 31x31 maze.
 
     uv run source/eval/eval_dev_like.py
-    uv run source/eval/eval_dev_like.py --seed 102 --goals 4 --agent-args "--fixes"
+    uv run source/eval/eval_dev_like.py --seed 102 --goals 4 --agent-args "--no-fixes"
+    uv run source/eval/eval_dev_like.py --seed 301 --maze-size 51 --routes 3
 
-MapAgent's flags are --agent-args, by default "" (MapAgent's own defaults: no fixes, online
+MapAgent's flags are --agent-args, by default "" (MapAgent's own defaults: fixes, online
 motion, goal camera "auto").
 
 Environment: a 31x31 maze of 0.2 m cells (Simulator rows / cols), msaa 4, camera 320x240 with
@@ -138,6 +139,10 @@ FIELDS = [
     "outcome",
     "final_distance_m",
     "heading_err_deg",
+    "agent_heading_err_deg",
+    "view_k",
+    "view_inliers",
+    "view_yaw_deg",
     "points_distance",
     "points_heading",
     "points_spl",
@@ -371,7 +376,9 @@ def card(distance: float, heading: float, spl: float) -> tuple[int, int, int]:
 def explore(seed: int, world: sim.Simulator) -> tuple[Path, dict]:
     """data/eval/dev_like/<seed>/ with its poses.json files, recorded if it is not there with
     these settings; ``(root, record summary)``."""
-    root = DATA_ROOT / (str(seed) + os.environ.get("DEV_LIKE_CACHE_SUFFIX", ""))
+    size = "" if ROWS == 31 else f"-m{ROWS}"
+    size += "" if CAPTURE_EVERY == 3 else f"-c{CAPTURE_EVERY}"
+    root = DATA_ROOT / (str(seed) + size + os.environ.get("DEV_LIKE_CACHE_SUFFIX", ""))
     want = {
         "rows": ROWS,
         "cols": COLS,
@@ -583,6 +590,30 @@ class DevAgent(ServerFrames):
         self.act_s: list[float] = []
         self.arrival: tuple[float, float] | None = None
         self.previous_pose: tuple | None = None
+        self.own_heading_deg = math.nan
+        self.view_inliers: int | None = None
+
+    def _yaw_to_view0(self, image):
+        """MapAgent's, plus the inlier count of the goal view it chose (``view_inliers``)."""
+        offsets: list[tuple[object, int]] = []
+        servo = self.servo
+        original = servo.offset
+
+        def offset(current, features, cx):
+            result = original(current, features, cx)
+            offsets.append((features, result[1]))
+            return result
+
+        servo.offset = offset
+        try:
+            yaw = super()._yaw_to_view0(image)
+        finally:
+            del servo.offset
+        self.view_inliers = None
+        if self.view:
+            chosen = self.goal_features[self.view[0]]
+            self.view_inliers = next(n for f, n in offsets if f is chosen)
+        return yaw
 
     def act(self, obs: Observation):
         session = self.factory.session
@@ -635,6 +666,8 @@ class DevAgent(ServerFrames):
         self.previous_pose = pose
         if decision & Action.CHECKIN:
             self.arrival = session.distance_heading()
+            if self.goal is not None:
+                self.own_heading_deg = (math.degrees(self.goal[2] - estimate.yaw) + 180) % 360 - 180
         return decision, ticks
 
 
@@ -648,13 +681,15 @@ def agent_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-turn-ticks", type=int, default=None)
     p.add_argument("--shortcut", action="store_true")
     p.add_argument("--corridor-m", type=float, default=map_agent.planner_module.CORRIDOR_M)
+    p.add_argument("--link-m", type=float, default=map_agent.planner_module.LINK_M)
     p.add_argument("--forward-ticks", type=int, default=map_agent.FORWARD_TICKS)
     p.add_argument("--guard-m", type=float, default=map_agent.GUARD_M)
     p.add_argument("--near-m", type=float, default=map_agent.NEAR_M)
     p.add_argument("--align-deg", type=float, default=map_agent.ALIGN_DEG)
     p.add_argument("--offset-m", type=float, default=map_agent.OFFSET_M)
     p.add_argument("--homing-max", type=int, default=map_agent.HOMING_MAX)
-    p.add_argument("--fixes", action="store_true")
+    p.add_argument("--no-fixes", action="store_true")
+    p.add_argument("--align-source", choices=map_agent.ALIGN_SOURCES, default="estimate")
     p.add_argument("--goal-camera", choices=map_agent.GOAL_CAMERAS, default="auto")
     p.add_argument("--floor-guard", action="store_true")
     p.add_argument("--floor-guard-frac", type=float, default=map_agent.FLOOR_GUARD_FRAC)
@@ -674,6 +709,7 @@ def agent_options(text: str) -> dict:
         "max_turn_ticks": a.max_turn_ticks,
         "shortcut": a.shortcut,
         "corridor_m": a.corridor_m,
+        "link_m": a.link_m,
         "arc_measured": measure_arcs() if a.arcs else None,
         "forward_ticks": a.forward_ticks,
         "guard_m": a.guard_m,
@@ -681,7 +717,8 @@ def agent_options(text: str) -> dict:
         "align_deg": a.align_deg,
         "offset_m": a.offset_m,
         "homing_max": a.homing_max,
-        "fixes": a.fixes,
+        "fixes": not a.no_fixes,
+        "align_source": a.align_source,
         "goal_camera": a.goal_camera,
         "floor_guard": a.floor_guard,
         "floor_guard_frac": a.floor_guard_frac,
@@ -832,6 +869,10 @@ def score_run(agent: DevAgent, goal: Goal, repeat: int, result, session, args) -
         "outcome": outcome,
         "final_distance_m": distance,
         "heading_err_deg": heading,
+        "agent_heading_err_deg": agent.own_heading_deg,
+        "view_k": agent.view[0] if agent.view else "",
+        "view_inliers": agent.view_inliers if agent.view else "",
+        "view_yaw_deg": agent.view[1] if agent.view else "",
         "points_distance": points[0],
         "points_heading": points[1],
         "points_spl": points[2],
@@ -1145,10 +1186,16 @@ def write_summary(rows: list[dict], env: dict, args, path: Path) -> str:
 
 
 def main() -> None:
+    global ROWS, COLS, ROUTES, CAPTURE_EVERY
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--seed", type=int, default=101, help="the maze (outside 1-12)")
+    p.add_argument("--maze-size", type=int, default=ROWS, help="maze rows and columns (cells)")
+    p.add_argument("--routes", type=int, default=ROUTES, help="exploration routes recorded")
+    p.add_argument(
+        "--capture-every", type=int, default=CAPTURE_EVERY, help="ticks per exploration frame"
+    )
     p.add_argument("--goals", type=int, default=10, help="goals, the simulator's included")
     p.add_argument("--repeats", type=int, default=1, help="runs per goal, other motion seeds")
     p.add_argument(
@@ -1168,6 +1215,9 @@ def main() -> None:
     p.add_argument("--only", default="", help="comma-separated goal ids to run (default: all)")
     p.add_argument("--tag", default="", help="suffix of the output directory, <seed>-<tag>")
     args = p.parse_args()
+    ROWS = COLS = args.maze_size
+    ROUTES = args.routes
+    CAPTURE_EVERY = args.capture_every
     out = OUT_ROOT / (f"{args.seed}-{args.tag}" if args.tag else str(args.seed))
     out.mkdir(parents=True, exist_ok=True)
 
@@ -1201,7 +1251,8 @@ def main() -> None:
     agent.encode = world.jpeg
     print(
         f"agent: turn rate {agent.turn_rate:.2f} deg, fallback FORWARD dx "
-        f"{agent.motion['FORWARD']['dx']:.3f} m, {agent.planner.n} nodes",
+        f"{agent.motion['FORWARD']['dx']:.3f} m, {agent.planner.n} nodes, links "
+        f"{agent.planner.link_counts}",
         flush=True,
     )
 
