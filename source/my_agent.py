@@ -30,10 +30,12 @@ Without a located record, or with too few matches to the aim, it replays the que
 from __future__ import annotations
 
 import argparse
+import cProfile
 import itertools
 import json
+import pstats
 import random
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 
 import cli
@@ -79,6 +81,17 @@ YAW_TOL = 8.0
 FORWARD_TICKS = 5
 TURN_DEG_PER_TICK = 3.4375
 """Degrees one LEFT or RIGHT tick turns, measured by eval/common.py's turn_deg_per_tick()."""
+GOAL_VIEWS = 4
+CHECKIN_VIEWS = 3
+CHECKIN_YAW = 5.0
+CHECKIN_INLIERS = 15
+STUCK_FORWARDS = 3
+STUCK_BACKWARD_TICKS = 2
+LOST_STEPS = 5
+OSCILLATION_WINDOW = 6
+OSCILLATION_FLIPS = 3
+MAX_SPINS = 2
+PROFILE_STEPS = 1000
 
 
 class Float32VLAD(VLADExtractor):
@@ -109,6 +122,8 @@ class MyAgent(BaselineAgent):
         eps: float = 1e-3,
         tau: float = 0.02,
         conf_threshold: float = CONF_THRESHOLD,
+        verify_candidates: int = 0,
+        geom_weight: float = 0.001,
         capture_every: int = 1,
         max_segment_ticks: int = MAX_SEGMENT_TICKS,
         stall_window: int = STALL_WINDOW,
@@ -118,6 +133,9 @@ class MyAgent(BaselineAgent):
         yaw_tol: float = YAW_TOL,
         forward_ticks: int = FORWARD_TICKS,
         turn_deg_per_tick: float = TURN_DEG_PER_TICK,
+        goal_views: int = GOAL_VIEWS,
+        checkin_views: int = CHECKIN_VIEWS,
+        checkin_yaw: float = CHECKIN_YAW,
     ) -> None:
         # BaselineAgent.__init__, with a float32 extractor.
         self.frames, bounds = load_frames(data_dir, subsample)
@@ -134,6 +152,18 @@ class MyAgent(BaselineAgent):
         self.yaw_tol = yaw_tol
         self.forward_ticks = forward_ticks
         self.turn_deg_per_tick = turn_deg_per_tick
+        self.goal_views = goal_views
+        self.checkin_views = checkin_views
+        self.checkin_yaw = checkin_yaw
+        self.goal_features: tuple[np.ndarray, np.ndarray | None] | None = None
+        self.verified = 0
+        self.stuck_count = 0
+        self.stuck = False
+        self.lost_count = 0
+        self.spin: list[tuple[str, int]] = []
+        self.turn_signs: deque[int] = deque(maxlen=OSCILLATION_WINDOW)
+        self.spin_count = 0
+        self._previous_located: Record | None = None
         self.servo: Servo | None = None
         """Built by setup(), which knows the camera."""
         self.extractor = Float32VLAD(n_clusters, cache_dir)
@@ -155,6 +185,8 @@ class MyAgent(BaselineAgent):
             else None
         )
         self.conf_threshold = conf_threshold
+        self.verify_candidates = verify_candidates
+        self.geom_weight = geom_weight
 
         self.goal: int | None = None
         self.current: int | None = None
@@ -211,6 +243,17 @@ class MyAgent(BaselineAgent):
 
     def setup(self, info: SessionInfo) -> None:
         super().setup(info)
+        views = info.targets[: max(1, self.goal_views)]
+        similarity = sum(self.database @ self.extractor.extract(view) for view in views)
+        self.goal = int(np.argmax(similarity))
+        print(f"goal: node {self.goal} from {len(views)} views")
+        self.goal_features = None
+        self.verified = self.stuck_count = self.lost_count = 0
+        self.stuck = False
+        self.spin = []
+        self.turn_signs = deque(maxlen=OSCILLATION_WINDOW)
+        self.spin_count = 0
+        self._previous_located = None
         self.moves = 0
         self.last = "-"
         self.no_path = False
@@ -238,8 +281,11 @@ class MyAgent(BaselineAgent):
             camera = np.asarray(info.camera.intrinsic_matrix, float)
             fx, cx = float(camera[0, 0]), float(camera[0, 2])
             if self.servo is None:
-                self.servo = Servo(fx, cx=cx)
+                self.servo = Servo(
+                    fx, cx=cx, cache_size=sum(len(paths) for paths in self.record_paths.values())
+                )
             self.servo.fx, self.servo.cx = fx, cx
+            self.goal_features = self.servo.features(info.targets[0])
         if self.filter is not None:
             self.filter.reset()
 
@@ -256,9 +302,15 @@ class MyAgent(BaselineAgent):
                     self._plan()
                 self._guard(obs.step)
             self._aim(obs.image)
+            self._verify(obs.image)
+            self._recover(obs.step)
             self._localised_step = obs.step
         self.decisions += 1
-        at_goal = not self.low_conf and self.path == [self.goal]
+        at_goal = (
+            self.verified >= self.checkin_views
+            if self.goal_features is not None
+            else not self.low_conf and self.path == [self.goal]
+        )
         if at_goal or obs.steps_left <= self.ticks:
             self.checkin_reason = "at_goal" if at_goal else "out_of_steps"
             print(f"check-in: {self.checkin_reason} (node {self.current}, step {obs.step})")
@@ -266,7 +318,16 @@ class MyAgent(BaselineAgent):
             return Action.CHECKIN
         self.moves += 1
         ticks = self.ticks
-        if self.low_conf:
+        if self.stuck:
+            self.stuck = False
+            self.last, ticks, self.source = "BACKWARD", STUCK_BACKWARD_TICKS, "stuck"
+            ticks = min(ticks, obs.steps_left - 1)
+        elif self.spin:
+            self.queue.clear()
+            self.last, ticks = self.spin.pop(0)
+            self.source = "lost"
+            ticks = min(ticks, obs.steps_left - 1)
+        elif self.low_conf:
             self.queue.clear()
             self.low_conf_decisions += 1
             self.last, self.source = LOW_CONF_MOVE, "low-conf"
@@ -278,7 +339,7 @@ class MyAgent(BaselineAgent):
             self.queue.clear()
             self.last = random.choice(sorted(MOVEMENT - {self.last}))
             self.source = "random"
-        elif self.yaw is not None:
+        elif self.yaw is not None and not self._oscillating(obs.step):
             assert self.follow is not None
             translation = self._translation(self.follow)
             if abs(self.yaw) > self.yaw_tol or translation is None:
@@ -329,7 +390,15 @@ class MyAgent(BaselineAgent):
         self.raw_node = int(np.argmax(similarity))
         node = self.raw_node
         if self.filter is not None:
-            self.filter.update(similarity)
+            observed = similarity
+            if self.servo is not None and self.verify_candidates > 0:
+                # Geometric verification: the top candidates gain geom_weight per inlier.
+                observed = similarity.copy()
+                for n in np.argsort(-similarity)[: self.verify_candidates]:
+                    record = (self.frames[n].trajectory, self.raw_index[n])
+                    yaw, inliers = self.servo.yaw_offset(image, self._record_image(record))
+                    observed[n] += self.geom_weight * (0 if yaw is None else inliers)
+            self.filter.update(observed)
             node, self.confidence = self.filter.estimate()
             self.filter_node = node
             self.low_conf = self.confidence < self.conf_threshold
@@ -337,6 +406,76 @@ class MyAgent(BaselineAgent):
                 return
         self.current = self.estimate = node
         self.match_distance = _distance(float(similarity[self.current]))
+
+    def _verify(self, image: np.ndarray) -> None:
+        """Count consecutive steps at the goal whose view matches the first target."""
+        self.verified += 1
+        if (
+            self.servo is None
+            or self.goal_features is None
+            or self.low_conf
+            or self.path != [self.goal]
+        ):
+            self.verified = 0
+            return
+        current = self.servo.features(image)
+        yaw, inliers = self.servo.offset(current, self.goal_features, self.servo.cx)
+        if yaw is None or inliers < CHECKIN_INLIERS or abs(yaw) > self.checkin_yaw:
+            self.verified = 0
+
+    def _oscillating(self, step: int) -> bool:
+        """Record a servo turn's direction; after OSCILLATION_FLIPS changes of direction within
+        the last OSCILLATION_WINDOW turns, drop the servo's yaw so this step falls through to the
+        queue and the hint."""
+        assert self.yaw is not None and self.follow is not None
+        if abs(self.yaw) <= self.yaw_tol and self._translation(self.follow) is not None:
+            return False
+        self.turn_signs.append(1 if self.yaw > 0 else -1)
+        signs = self.turn_signs
+        flips = sum(a != b for a, b in itertools.pairwise(signs))
+        if len(signs) < OSCILLATION_WINDOW or flips < OSCILLATION_FLIPS:
+            return False
+        self.turn_signs.clear()
+        print(f"turn oscillation: skipping servo turn (step {step})")
+        self.yaw = None
+        return True
+
+    def _recover(self, step: int) -> None:
+        """Back off after STUCK_FORWARDS FORWARD moves that left the located record unchanged;
+        spin after LOST_STEPS steps without a located record, at most MAX_SPINS in a row."""
+        if self.located is not None:
+            self.spin_count = 0
+        if self.spin:
+            self.lost_count = 0
+        elif self.aimed and self.located is None:
+            self.lost_count += 1
+        else:
+            self.lost_count = 0
+        if self.last == "FORWARD" and self.located is not None:
+            self.stuck_count = self.stuck_count + 1 if self.located == self._previous_located else 0
+        else:
+            self.stuck_count = 0
+        self._previous_located = self.located
+        if self.stuck_count >= STUCK_FORWARDS:
+            self.stuck_count = 0
+            self.stuck = True
+            self.queue.clear()
+            self._clear_aim()
+        elif self.lost_count >= LOST_STEPS:
+            self.lost_count = 0
+            self.queue.clear()
+            self._clear_aim()
+            if self.spin_count + 1 > MAX_SPINS:
+                self.spin_count = 0
+                self.stuck = True
+                print(f"spin limit: backing off (step {step})")
+                return
+            self.spin_count += 1
+            remaining = round(360 / self.turn_deg_per_tick)
+            cap = max(1, min(self.max_segment_ticks, P.MAX_REPEAT))
+            while remaining > 0:
+                self.spin.append(("LEFT", min(remaining, cap)))
+                remaining -= cap
 
     def _plan(self) -> None:
         """The path from current to the goal (empty, and no_path set, in another component),
@@ -549,6 +688,8 @@ def _top_shortcuts(
     ``(i, j, similarity)``. Scans ``database @ database.T`` a block of rows at a time with a
     running top-k, so the full N x N matrix never exists. Masked pairs score -2, as in the
     baseline."""
+    if top_k <= 0:
+        return []
     n = len(database)
     top_k = min(top_k, n * n)
     best = np.empty(0, database.dtype)
@@ -678,7 +819,37 @@ if __name__ == "__main__":
         help="visual shortcut edges per 1000 nodes",
     )
     add_filter_args(parser)
+    parser.add_argument(
+        "--verify-candidates",
+        type=int,
+        default=0,
+        help="filter: top visual matches checked by feature matching (0: off)",
+    )
+    parser.add_argument(
+        "--geom-weight",
+        type=float,
+        default=0.001,
+        help="filter: similarity added per inlier of a verified candidate",
+    )
     add_control_args(parser)
+    parser.add_argument(
+        "--goal-views", type=int, default=GOAL_VIEWS, help="targets summed to pick the goal node"
+    )
+    parser.add_argument(
+        "--checkin-views",
+        type=int,
+        default=CHECKIN_VIEWS,
+        help="consecutive verified decisions at the goal before checking in",
+    )
+    parser.add_argument(
+        "--checkin-yaw",
+        type=float,
+        default=CHECKIN_YAW,
+        help="degrees of yaw to the first target a verified check-in allows",
+    )
+    parser.add_argument(
+        "--profile", action="store_true", help="print the top 15 functions of the first 1000 steps"
+    )
     parser.add_argument("--ticks", type=int, default=5, help="ticks per move")
     parser.add_argument(
         "--capture-every", type=int, default=1, help="ticks per recorded exploration step"
@@ -686,6 +857,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--random-every", type=int, default=10, help="random move every N moves (0: never)"
     )
+    parser.add_argument("--max-steps", type=int, default=10_000, help="step budget for this run")
+    parser.add_argument("--no-viewer", action="store_true", help="do not open the viewer window")
     args = parser.parse_args()
 
     challenge = cli.challenge(args)
@@ -700,7 +873,31 @@ if __name__ == "__main__":
         shortcut_gap_frac=args.shortcut_gap_frac,
         shortcuts_per_1k=args.shortcuts_per_1k,
         cache_dir=Path("cache") / challenge.replace(":", "-"),
+        goal_views=args.goal_views,
+        checkin_views=args.checkin_views,
+        checkin_yaw=args.checkin_yaw,
         **filter_kwargs(args),
+        verify_candidates=args.verify_candidates,
+        geom_weight=args.geom_weight,
         **control_kwargs(args),
     )
-    run(agent, challenge, **cli.run_options(args))
+    if args.profile:
+        profiler, taken, act = cProfile.Profile(), [0], agent.act
+
+        def profiled(obs: Observation) -> Action | tuple[Action, int]:
+            if taken[0] >= PROFILE_STEPS:
+                return act(obs)
+            profiler.enable()
+            try:
+                return act(obs)
+            finally:
+                profiler.disable()
+                taken[0] += 1
+                if taken[0] == PROFILE_STEPS:
+                    pstats.Stats(profiler).sort_stats("cumulative").print_stats(15)
+
+        agent.act = profiled
+    budget = {"max_steps": args.max_steps} if args.local is not None else {}
+    opts = cli.run_options(args)
+    opts["viewer"] = not args.no_viewer
+    run(agent, challenge, **budget, **opts)
