@@ -2896,7 +2896,7 @@ wheels = [
 [[package]]
 name = "vis-nav-player"
 version = "0.0.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "networkx", version = "3.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or (extra == 'group-14-vis-nav-player-rl-cpu' and extra == 'group-14-vis-nav-player-rl-cuda')" },
     { name = "networkx", version = "3.6.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11' or (extra == 'group-14-vis-nav-player-rl-cpu' and extra == 'group-14-vis-nav-player-rl-cuda')" },

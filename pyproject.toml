@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [tool.uv]
-package = false
+package = true
 # `uv sync` installs the core, dev, and the local simulator (3 MB): --local works out of
 # the box, and a plain `uv sync` does not remove it again. The rl groups are opted into.
 default-groups = ["dev", "local"]
@@ -67,12 +67,26 @@ rl = [{ include-group = "local" }, "gymnasium>=1.0", "skrl[torch]>=2.1"]
 rl-cpu = [{ include-group = "rl" }, "torch>=2.4"]
 rl-cuda = [{ include-group = "rl" }, "torch>=2.4"]
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# The modules of source/ and source/eval/ are top-level (`import geometry`, `from common import
+# ...`): the editable install puts both folders on the path, so no script edits sys.path.
+[tool.hatch.build]
+dev-mode-dirs = ["source", "source/eval"]
+
+[tool.hatch.build.targets.wheel]
+only-include = ["source"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# Archived code, kept as it was (source/legacy/README.md).
+extend-exclude = ["source/legacy"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
