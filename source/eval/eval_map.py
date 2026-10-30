@@ -36,22 +36,26 @@ import argparse
 import functools
 import json
 import math
-import sys
 from pathlib import Path
 
 import cv2
+import mapping
 import numpy as np
 import vis_nav_sim as sim
-from common import fmt, ints, textures, wrap, write_csv
+from common import fmt, ints, textures, write_csv
 from eval_cues import Walls, stored_floor
-from eval_geometry import Frame, wall_cells, wall_distance
-from geometry import MAP_RES, OccupancyMap, rigid_fit, transform
+from geometry import (
+    MAP_RES,
+    OccupancyMap,
+    Pose,
+    between,
+    compose,
+    rigid_fit,
+    transform,
+    wrap,
+)
 from scipy.ndimage import distance_transform_edt
 from scipy.spatial import cKDTree
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-import mapping  # noqa: E402
 
 DATA_ROOT = Path("data") / "eval"
 TOLS = (0.05, 0.10)
@@ -66,6 +70,55 @@ MAP_COLOUR = (60, 60, 60)
 OVERLAY_COLOUR = (240, 170, 80)
 VARIANTS = ("odom", "graph")
 STAGES = ("calibration", "odometry", "vlad", "closures", "optimise", "grid")
+
+
+class Frame:
+    """The map frame against the world: the map pose ``origin`` is the world pose ``truth``."""
+
+    def __init__(self, origin: Pose, truth: Pose) -> None:
+        self.p0 = np.array(truth[:2])
+        self.q0 = np.array(origin[:2])
+        self.phi = origin[2] - truth[2]
+        c, s = math.cos(self.phi), math.sin(self.phi)
+        self.rotation = np.array([[c, -s], [s, c]])
+
+    def to_map(self, world: np.ndarray) -> np.ndarray:
+        """``(n, 2)`` world points, or ``(n, 3)`` poses, in the map frame."""
+        xy = (world[:, :2] - self.p0) @ self.rotation.T + self.q0
+        if world.shape[1] == 2:
+            return xy
+        return np.column_stack([xy, world[:, 2] + self.phi])
+
+    def to_world(self, xy: np.ndarray) -> np.ndarray:
+        return (xy - self.q0) @ self.rotation + self.p0
+
+    def pose_to_world(self, pose: Pose) -> Pose:
+        x, y = self.to_world(np.array([pose[:2]]))[0]
+        return float(x), float(y), pose[2] - self.phi
+
+
+def wall_cells(world: sim.Simulator, walls: Walls) -> np.ndarray:
+    """World centres of the MAP_RES cells (aligned on the world origin) a true wall passes
+    through."""
+    lo, hi = -0.5, (max(world.occupancy.shape) - 1) * world.cell_size + 0.5
+    axis = np.arange(lo, hi, MAP_RES) + MAP_RES / 2
+    x, y = np.meshgrid(axis, axis)
+    hit = np.zeros(x.shape, bool)
+    for x0, x1, y0, y1 in walls.rects:
+        gap_x = np.maximum(np.maximum(x0 - x, x - x1), 0.0)
+        gap_y = np.maximum(np.maximum(y0 - y, y - y1), 0.0)
+        hit |= (gap_x <= MAP_RES / 2) & (gap_y <= MAP_RES / 2)
+    return np.stack([x[hit], y[hit]], axis=1)
+
+
+def wall_distance(walls: Walls, xy: np.ndarray) -> np.ndarray:
+    """Metres from each world point to the nearest true wall."""
+    distance = np.full(len(xy), np.inf)
+    for x0, x1, y0, y1 in walls.rects:
+        gap_x = np.maximum(np.maximum(x0 - xy[:, 0], xy[:, 0] - x1), 0.0)
+        gap_y = np.maximum(np.maximum(y0 - xy[:, 1], xy[:, 1] - y1), 0.0)
+        np.minimum(distance, np.hypot(gap_x, gap_y), out=distance)
+    return distance
 
 
 def record(seed: int) -> Path:
@@ -104,9 +157,7 @@ class MapTruth:
         """The true world ``pose`` in the map frame as the map has it: the mapped pose of the
         frame nearest it, composed with the true relative pose from that frame to ``pose``."""
         n = int(self.tree.query(pose[:2])[1])
-        return mapping.compose(
-            self.store.pose(n), mapping.between(tuple(self.poses[n]), tuple(pose))
-        )
+        return compose(self.store.pose(n), between(tuple(self.poses[n]), tuple(pose)))
 
 
 # -- metrics
@@ -166,7 +217,7 @@ def closure_counts(result: mapping.MapResult, truth: list[np.ndarray], variant: 
     )
     wrong = 0
     for c in accepted:
-        measured = mapping.between(tuple(truth[c.a[0]][c.a[1]]), tuple(truth[c.b[0]][c.b[1]]))
+        measured = between(tuple(truth[c.a[0]][c.a[1]]), tuple(truth[c.b[0]][c.b[1]]))
         wrong += (
             math.hypot(measured[0] - c.pose[0], measured[1] - c.pose[1]) > FALSE_CLOSURE_M
             or abs(math.degrees(wrap(measured[2] - c.pose[2]))) > WRONG_CLOSURE_DEG

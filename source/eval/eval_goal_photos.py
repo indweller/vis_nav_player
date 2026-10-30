@@ -25,20 +25,16 @@ from __future__ import annotations
 
 import argparse
 import math
-import sys
 from pathlib import Path
 
 import cv2
+import mapping
 import numpy as np
 import vis_nav_sim as sim
 from common import fmt, ints, textures, write_csv
 from eval_cues import Walls, floor_truth
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-import mapping  # noqa: E402
-from geometry import FLOOR_MASK_PATH, Camera, FloorMask, ranges  # noqa: E402
-from goal import TARGET_CAMERA_HEIGHT, TARGET_CY_SHIFT  # noqa: E402
+from geometry import FLOOR_MASK_PATH, Camera, FloorMask, ranges
+from goal import TARGET_CAMERA_HEIGHT, TARGET_CY_SHIFT
 
 VARIANTS = [(m, j) for m in (1, 4) for j in (False, True)]
 FIELDS = [

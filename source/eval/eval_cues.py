@@ -46,8 +46,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 import vis_nav_sim as sim
-from common import cell_of, fmt, gt_dir, ints, parser, textures, wrap, write_csv
-from geometry import FAR, FLOOR_MASK_PATH, Camera, FloorMask, free_space
+from common import cell_of, fmt, gt_dir, ints, parser, textures, write_csv
+from geometry import FAR, FLOOR_MASK_PATH, Camera, FloorMask, free_space, wrap
 from servo import Servo
 
 WALL_HALF = 0.0125

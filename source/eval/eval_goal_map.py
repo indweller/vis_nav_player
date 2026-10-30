@@ -42,23 +42,18 @@ from __future__ import annotations
 
 import argparse
 import math
-import sys
 from pathlib import Path
 
 import cv2
+import frozen_map
+import goal
+import mapping
 import numpy as np
 import vis_nav_sim as sim
-from common import cell_centre, fmt, ints, textures, wrap, write_csv, yaw_error_deg
+from common import cell_centre, fmt, ints, textures, write_csv, yaw_error_deg
 from eval_cues import Walls, stored_floor
-from eval_geometry import Frame
-from eval_map import MAP_COLOUR, Canvas, MapTruth, record, true_poses
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-import frozen_map  # noqa: E402
-import goal  # noqa: E402
-import mapping  # noqa: E402
-from geometry import LAYOUT_MIN, Camera  # noqa: E402
+from eval_map import MAP_COLOUR, Canvas, Frame, MapTruth, record, true_poses
+from geometry import LAYOUT_MIN, Camera, between, wrap
 
 SUCCESS_M, SUCCESS_DEG = 0.2, 30.0
 LOOSE_M = 0.4
@@ -199,7 +194,7 @@ def score(
     if found.relative is not None:
         camera = (true[0], true[1], true[2] + found.k * math.pi / 2)
         row["rel_pos_err_m"], row["rel_yaw_err_deg"] = pose_error(
-            found.relative, mapping.between(true_frame, camera)
+            found.relative, between(true_frame, camera)
         )
     return row
 

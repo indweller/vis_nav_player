@@ -63,28 +63,24 @@ from pathlib import Path
 from unittest import mock
 
 import cv2
+import frozen_map
+import geometry
+import goal as goal_module
+import localiser as localiser_module
+import map_agent
+import mapping
 import numpy as np
 import vis_nav_sim as sim
 from common import cell_centre, cell_of, fmt, geodesic, textures, write_csv
 from eval_closed_loop import ServerFrames, longest_stall, spread
 from eval_cues import Walls, stored_floor
-from eval_geometry import Frame
 from eval_goal_photos import range_difference
-from eval_map import MAP_COLOUR, Canvas, MapTruth, true_poses
+from eval_map import MAP_COLOUR, Canvas, Frame, MapTruth, true_poses
+from geometry import ranges
 from scipy.spatial import cKDTree
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-import frozen_map  # noqa: E402
-import geometry  # noqa: E402
-import goal as goal_module  # noqa: E402
-import localiser as localiser_module  # noqa: E402
-import map_agent  # noqa: E402
-import mapping  # noqa: E402
-from geometry import ranges  # noqa: E402
-from vis_nav_sdk import Action, Observation, run  # noqa: E402
-from vis_nav_sdk import local as sdk_local  # noqa: E402
-from vis_nav_sdk.session import Arrival, Result  # noqa: E402
+from vis_nav_sdk import Action, Observation, run
+from vis_nav_sdk import local as sdk_local
+from vis_nav_sdk.session import Arrival, Result
 
 ROWS = COLS = 31
 MSAA = 4
@@ -243,7 +239,7 @@ SIM_MODULE.Simulator = DevSimulator
 
 def pose_error(pose, goal) -> tuple[float, float]:
     """``(metres, degrees)`` from ``pose`` to ``goal``, as the simulator's distance_heading()."""
-    heading = abs(math.degrees(mapping.wrap(pose[2] - goal[2])))
+    heading = abs(math.degrees(geometry.wrap(pose[2] - goal[2])))
     return math.hypot(pose[0] - goal[0], pose[1] - goal[1]), heading
 
 
@@ -623,7 +619,7 @@ class DevAgent(ServerFrames):
         if self.update.replan:
             self.plans.append(self.update.path)
         applied = (
-            mapping.between(self.previous_pose, pose)
+            geometry.between(self.previous_pose, pose)
             if self.previous_pose is not None and taken is not None
             else None
         )
@@ -747,7 +743,7 @@ def score_run(agent: DevAgent, goal: Goal, repeat: int, result, session, args) -
     goal_err = math.dist(found[:2], true_goal[:2]) if found is not None else math.nan
     goal_cm_err = math.dist(found[:2], consistent_goal[:2]) if found is not None else math.nan
     goal_yaw_err = (
-        abs(math.degrees(mapping.wrap(found[2] - consistent_goal[2])))
+        abs(math.degrees(geometry.wrap(found[2] - consistent_goal[2])))
         if found is not None
         else math.nan
     )

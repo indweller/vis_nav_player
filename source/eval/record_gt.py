@@ -6,7 +6,7 @@ nearest unvisited free cell, one frame, pose and action every --capture-every ti
     uv run source/eval/record_gt.py --mazes 7 --capture-every 1 --coverage 0.95
 
 Writes data/gt/<seed>-c<k>/ in Simulator.record's layout (traj_<i>/<k>.jpg, data_info.json,
-target.jpg), each record with "x", "y", "yaw" added, so load_frames reads it unchanged.
+target.jpg), each record with "x", "y", "yaw" added.
 """
 
 from __future__ import annotations
@@ -31,10 +31,9 @@ from common import (
     ints,
     parser,
     textures,
-    wrap,
     write_csv,
 )
-from vlad import load_frames
+from geometry import wrap
 
 ROUTES = 3
 COVERAGE = 0.9
@@ -196,10 +195,6 @@ def record(
     save(out, world, records, routes)
     # The SIFT cache is keyed by image path, which a re-recording keeps.
     shutil.rmtree(CACHE_ROOT / gt_name(seed, capture_every), ignore_errors=True)
-
-    frames, bounds = load_frames(out)
-    if len(frames) != len(records) or len(bounds) != routes:
-        raise RuntimeError(f"load_frames read {len(frames)} of {len(records)} records")
     row = {
         "seed": seed,
         "capture_every": capture_every,

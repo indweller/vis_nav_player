@@ -11,10 +11,10 @@ results/eval/replay/<name>/ (summary.md, ticks.csv, replay.png):
    <data>/target.jpg (goal.target_camera): per view the SIFT epipolar inliers and the rigid
    relative pose; the best view gives the distance to the goal and the heading error (degrees to
    turn left to the goal's heading) the frame had at check-in.
-2. Replay: the current Localiser (MapAgent's defaults: online motion on, blocked-zero off) on the
-   frozen map, fed the logged frames and, as the move since the previous frame, the previous
-   tick's returned action (WAIT / CHECKIN: no move), from the spawn (0, 0, 0). Per tick: VO
-   source, fix status, lost, the online medians; and the distance to the logged estimate.
+2. Replay: the current Localiser (as MapAgent builds it) on the frozen map, fed the logged
+   frames and, as the move since the previous frame, the previous tick's returned action (WAIT /
+   CHECKIN: no move), from the spawn (0, 0, 0). Per tick: VO source, fix status, lost, the
+   online medians; and the distance to the logged estimate.
 3. Contacts: FORWARD ticks whose next frame is identical or near-identical
    (localiser.grey_difference under --contact-diff).
 4. Path: the logged estimated path length and step count against the current planner's
@@ -27,33 +27,24 @@ import argparse
 import csv
 import json
 import math
-import sys
 from collections import Counter
 from pathlib import Path
 
 import cv2
+import frozen_map
+import geometry
+import map_agent
+import mapping
+import matplotlib
 import numpy as np
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-import frozen_map  # noqa: E402
-import geometry  # noqa: E402
-import map_agent  # noqa: E402
-import mapping  # noqa: E402
-import matplotlib  # noqa: E402
-import planner as planner_module  # noqa: E402
-from geometry import Camera, FloorMask  # noqa: E402
-from goal import find_goal, target_camera  # noqa: E402
-from localiser import Localiser, grey_difference, grey_small  # noqa: E402
-from mapping import between, compose, wrap  # noqa: E402
-
-BLOCKED_DIFF = 17.3
-"""--blocked-zero: the grey difference (localiser.grey_difference) under which a failed-VO
-FORWARD / BACKWARD tick is taken as blocked (fitted on a dev-like run, F1 0.97)."""
-from view_map import draw as draw_map  # noqa: E402
+import planner as planner_module
+from geometry import Camera, FloorMask, between, compose, wrap
+from goal import find_goal, target_camera
+from localiser import Localiser, grey_difference, grey_small
+from view_map import draw as draw_map
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.pyplot as plt
 
 ROOT = Path(__file__).resolve().parents[2]
 LOG = "20261029T051014_783729Z_pid37387_62b9cea0"
@@ -209,8 +200,6 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--log", default=f"data/logs/{LOG}", help="extracted run log directory")
     parser.add_argument("--data", default=f"data/{DATA}", help="exploration data directory")
     parser.add_argument("--contact-diff", type=float, default=CONTACT_DIFF)
-    parser.add_argument("--blocked-zero", action="store_true")
-    parser.add_argument("--no-online-motion", action="store_true")
     args = parser.parse_args(argv)
     log, root = ROOT / args.log, ROOT / args.data
     out = ROOT / "results" / "eval" / "replay" / log.name
@@ -231,10 +220,7 @@ def main(argv: list[str] | None = None) -> None:
     best = check["best"]
 
     # 2. replay
-    localiser = Localiser(
-        store, camera, floor, motion=motion,
-        blocked_zero=localiser_blocked(args), online_motion=not args.no_online_motion,
-    )  # fmt: skip
+    localiser = Localiser(store, camera, floor, motion=motion)
     rows = replay(events, log, localiser, args.contact_diff)
     with (out / "ticks.csv").open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0]))
@@ -244,7 +230,6 @@ def main(argv: list[str] | None = None) -> None:
     # 3. contacts
     hits = contacts(rows, args.contact_diff)
     identical = contacts(rows, 1e-9)
-    loose = contacts(rows, BLOCKED_DIFF)
     forwards = sum(r["action"] == "FORWARD" for r in rows)
     smallest = sorted(
         (r["grey_to_next"], r["tick"])
@@ -261,8 +246,6 @@ def main(argv: list[str] | None = None) -> None:
     for name, target in (("plain", goal), ("logged goal", logged_goal)):
         if target is not None:
             plans[name] = planner.plan(spawn, target)
-    if "plain" in plans and plans["plain"] is not None:
-        plans["shortcut"] = plans["plain"].shortcut(store, planner_module.CORRIDOR_M)
     turn_deg = float(np.mean([abs(math.degrees(motion[a]["dyaw"])) for a in ("LEFT", "RIGHT")]))
     xy = np.array([r["logged_x"] for r in rows]), np.array([r["logged_y"] for r in rows])
     logged_len = float(np.hypot(np.diff(xy[0]), np.diff(xy[1])).sum())
@@ -377,8 +360,7 @@ def main(argv: list[str] | None = None) -> None:
     lines += ["", "## 3. Contacts", ""]
     lines += [
         f"FORWARD ticks: {forwards}. Followed by an identical frame: {len(identical)}; "
-        f"by a frame with grey difference under {args.contact_diff:g}: **{len(hits)}**; "
-        f"under {BLOCKED_DIFF} (the blocked-zero threshold): {len(loose)}.",
+        f"by a frame with grey difference under {args.contact_diff:g}: **{len(hits)}**.",
         f"Indices (under {args.contact_diff:g}): {runs(hits) or 'none'}.",
         "Smallest FORWARD-to-next grey differences: "
         + ", ".join(f"{t}: {g:.2f}" for g, t in smallest),
@@ -396,9 +378,8 @@ def main(argv: list[str] | None = None) -> None:
             lines.append(f"- Plan ({name}): none")
             continue
         f_, t_, n_ = steps_for(p, motion, turn_deg)
-        extra = "" if math.isnan(p.length_before) else f" (before shortcut {p.length_before:.2f} m)"
         lines.append(
-            f"- Plan ({name}): {p.length:.2f} m{extra}, about {n_} steps "
+            f"- Plan ({name}): {p.length:.2f} m, about {n_} steps "
             f"({f_} FORWARD + {t_} turn ticks at {turn_deg:.2f} deg, simulated with the agent's "
             f"steering rule, no noise)."
         )
@@ -412,10 +393,6 @@ def main(argv: list[str] | None = None) -> None:
     (out / "summary.md").write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
     print(f"\nwrote {out}")
-
-
-def localiser_blocked(args) -> float | None:
-    return BLOCKED_DIFF if args.blocked_zero else None
 
 
 if __name__ == "__main__":

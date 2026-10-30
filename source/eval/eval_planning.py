@@ -53,30 +53,24 @@ from __future__ import annotations
 
 import argparse
 import math
-import sys
 from collections import Counter
 from pathlib import Path
 
 import cv2
+import frozen_map
+import goal
+import localiser as localiser_module
+import mapping
+import navigator as navigator_module
 import numpy as np
+import planner as planner_module
 import vis_nav_sim as sim
-from common import cell_of, fmt, geodesic, ints, textures, write_csv
+from common import bfs, cell_of, fmt, geodesic, ints, textures, write_csv
 from eval_cues import Walls, stored_floor
-from eval_geometry import Frame
 from eval_goal_map import jpeg
-from eval_map import MAP_COLOUR, Canvas, MapTruth, record, true_poses
+from eval_map import MAP_COLOUR, Canvas, Frame, MapTruth, record, true_poses
+from geometry import LAYOUT_MIN, Camera
 from record_gt import ACTIONS, Driver, route
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-import frozen_map  # noqa: E402
-import goal  # noqa: E402
-import localiser as localiser_module  # noqa: E402
-import mapping  # noqa: E402
-import navigator as navigator_module  # noqa: E402
-import planner as planner_module  # noqa: E402
-from common import bfs  # noqa: E402
-from geometry import LAYOUT_MIN, Camera  # noqa: E402
 
 VARIANTS = ("direct", "detour")
 GOALS = ("found", "true")

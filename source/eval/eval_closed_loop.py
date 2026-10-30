@@ -28,12 +28,8 @@ in scores 0 points, tier "none". Per run also:
     by the homing test, timed_out = --homing-max, no_homing; home_ticks, home_fixes);
   - the longest stretch of ticks with no new minimum of the geodesic distance to the goal;
   - the fraction of ticks in each mode, and the ticks by mode and by action (FORWARD, BACKWARD,
-    LEFT, RIGHT, the two arcs; LEFT + RIGHT are the ticks turning in place), the oracle's steps and
-    ``spl_ticks`` = oracle_steps / ticks;
-  - the planned paths: each plan's length before and after the navigator's shortcut, and the
-    shortcut segments (more than one hop pulled into one) whose true positions cross a true wall
-    (the segment's end points moved to the truth through the nearest mapped frame, as
-    MapTruth.consistent does, but backwards).
+    LEFT, RIGHT; LEFT + RIGHT are the ticks turning in place), the oracle's steps and
+    ``spl_ticks`` = oracle_steps / ticks; the plans made.
 
 --seeds N (default 3) drives each maze and goal with N motion seeds (the maze's plus
 MOTION_SEED_OFFSET, plus 1000 per extra). The agent is built from MapAgent's flags
@@ -51,24 +47,18 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import math
-import sys
 from collections import Counter
 from pathlib import Path
 
 import cv2
+import map_agent
 import numpy as np
 import vis_nav_sim as sim
 from common import cell_of, fmt, geodesic, ints, textures, write_csv
 from eval_cues import Walls, stored_floor
-from eval_geometry import Frame
-from eval_map import MAP_COLOUR, Canvas, MapTruth, record, true_poses
-from eval_planning import segment_hits_rects
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-import map_agent  # noqa: E402
-from vis_nav_sdk import Action, Observation, run  # noqa: E402
-from vis_nav_sdk.local import local_session  # noqa: E402
+from eval_map import MAP_COLOUR, Canvas, Frame, MapTruth, record, true_poses
+from vis_nav_sdk import Action, Observation, run
+from vis_nav_sdk.local import local_session
 
 GOALS = ("found", "true", "map-true")
 MODES = ("nav", "guard", "home", "search")
@@ -93,7 +83,7 @@ STAGES = (
     "distance",
 )
 BLOCKS = ("Distance", "Heading", "SPL")
-ACTIONS = ("FORWARD", "BACKWARD", "LEFT", "RIGHT", "FORWARD|LEFT", "FORWARD|RIGHT")
+ACTIONS = ("FORWARD", "BACKWARD", "LEFT", "RIGHT")
 FIELDS = [
     "config",
     "seed",
@@ -126,10 +116,6 @@ FIELDS = [
     *(f"act_{a.lower().replace('|', '_')}" for a in ACTIONS),
     "turn_ticks",
     "plans",
-    "path_before_m",
-    "path_after_m",
-    "pulled_segments",
-    "pulled_crossing",
     "final_err_m",
     "final_to_goal_m",
     "final_cm_err_m",
@@ -206,19 +192,6 @@ class Maze:
             float(v) for v in self.frame.to_map(np.array([self.world.target]))[0]
         )
         self.consistent_goal = self.truth.consistent(self.world.target)
-
-    def true_xy(self, point: np.ndarray) -> np.ndarray:
-        """A map-frame position in the world: through the mapped frame nearest it, its true pose
-        and the map's pose of it (the inverse of MapTruth.consistent)."""
-        n = int(np.argmin(np.hypot(*(self.truth.store.xy - point).T)))
-        x, y, yaw = self.truth.store.pose(n)
-        turn = self.truth.poses[n, 2] - yaw
-        c, s = math.cos(turn), math.sin(turn)
-        dx, dy = point[0] - x, point[1] - y
-        return self.truth.poses[n, :2] + np.array([c * dx - s * dy, s * dx + c * dy])
-
-    def crosses_wall(self, a: np.ndarray, b: np.ndarray) -> bool:
-        return segment_hits_rects(self.walls.rects, self.true_xy(a), self.true_xy(b))
 
 
 def motion_seed(maze: Maze, motion: int) -> int:
@@ -338,9 +311,6 @@ def score_run(
     result, arrival = run_["result"], run_["arrival"]
     actions = Counter(t["action"] for t in log)
     paths = [t["path"] for t in log if t["path"] is not None]
-    shortcut = [p for p in paths if math.isfinite(p.length_before)]
-    pulled = [seg for p in shortcut for seg in p.pulled]
-    crossing = sum(maze.crosses_wall(a, b) for a, b in pulled)
     row = {
         "config": config,
         "seed": maze.seed,
@@ -370,12 +340,6 @@ def score_run(
         **{f"act_{a.lower().replace('|', '_')}": actions[a] for a in ACTIONS},
         "turn_ticks": actions["LEFT"] + actions["RIGHT"],
         "plans": len(paths),
-        "path_before_m": (
-            float(np.mean([p.length_before for p in shortcut])) if shortcut else math.nan
-        ),
-        "path_after_m": float(np.mean([p.length for p in shortcut])) if shortcut else math.nan,
-        "pulled_segments": len(pulled),
-        "pulled_crossing": crossing,
         "final_err_m": float(world_error[-1]),
         "final_to_goal_m": math.dist(log[-1]["estimate"][:2], run_["goal"][:2]),
         "final_cm_err_m": float(cm_error[-1]),
@@ -586,19 +550,6 @@ def summarise(rows: list[dict]) -> None:
             + f" | {r['turn_ticks']:>7} | "
             + " ".join(f"{r[f'ticks_{m}']:>5}" for m in MODES)
             + f" | {r['score_distance']:>4g} {r['score_heading']:>4g} {r['score_spl']:>5.2f}"
-        )
-    shortcut = [r for r in rows if math.isfinite(r["path_before_m"])]
-    if shortcut:
-        print("\nplanned paths (mean per plan) and shortcut segments crossing a true wall:")
-        for r in shortcut:
-            print(
-                f"{r['seed']:>4} {r['goal']:<8} | {r['plans']:>3} plans "
-                f"{r['path_before_m']:.2f} -> {r['path_after_m']:.2f} m | "
-                f"{r['pulled_crossing']}/{r['pulled_segments']} shortcut segments cross a wall"
-            )
-        print(
-            f"  all: {sum(r['pulled_crossing'] for r in shortcut)}/"
-            f"{sum(r['pulled_segments'] for r in shortcut)} cross a wall"
         )
     print("\nfinal error decomposition (metres; heading at check-in in degrees):")
     print(
