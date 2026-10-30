@@ -58,10 +58,9 @@ import mapping
 import navigator as navigator_module
 import numpy as np
 import planner as planner_module
-from geometry import Camera, FloorMask
+from geometry import Camera, FloorMask, Pose, between, wrap
 from goal import find_goal
 from localiser import Localiser
-from mapping import between, wrap
 from servo import Servo
 from vis_nav_sdk import Action, Agent, Observation, Result, SessionInfo, run
 
@@ -84,8 +83,6 @@ LOW_STEPS = 5
 
 GOAL_VIEW_PX = 320
 """Width of each of the four goal views split from target.jpg."""
-
-Pose = tuple[float, float, float]
 
 
 @dataclass(frozen=True)
@@ -242,7 +239,6 @@ class MapAgent(Agent):
             self.camera,
             self.floor,
             motion=self.motion,
-            online_motion=True,
         )
         if self.goal_override is not None:
             self.goal = tuple(float(v) for v in self.goal_override)

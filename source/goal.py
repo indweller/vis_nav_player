@@ -22,20 +22,22 @@ from typing import NamedTuple
 
 import cv2
 import numpy as np
-from frozen_map import FrozenMap, vlad
+from frozen_map import FrozenMap
 from geometry import (
     LAYOUT_MIN,
     Camera,
     FloorMask,
     WallView,
+    compose,
     epipolar_inliers,
     layout_score,
     match_features,
     relative_pose,
     transform,
+    vlad,
     wall_view,
+    wrap,
 )
-from mapping import compose, wrap
 from servo import Servo
 
 TOP_K = 20
@@ -171,7 +173,9 @@ def find_goal(
         c = place(entry)
         near = np.flatnonzero(np.hypot(*(store.xy - (c.x, c.y)).T) <= NEAR_M)
         mapped_points = store.surroundings(near)
-        candidates.append(c._replace(layout=layout_score(mapped_points, scan, c[3:6])[0]))
+        candidates.append(
+            c._replace(layout=layout_score(mapped_points, scan, (c.x, c.y, c.yaw))[0])
+        )
     if ranking is not None:
         ranking.extend(candidates)
     best = max(candidates, key=lambda c: (c.layout >= layout_min, c.inliers))

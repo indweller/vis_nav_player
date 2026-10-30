@@ -5,15 +5,14 @@ Plot a frozen map from an exploration data directory, offline (no server, no ses
 - each route's trajectory, in its own colour,
 - the spawn (0, 0, 0) and the pose ``find_goal`` gives for ``target.jpg``, each with a heading
   arrow,
-- the planner's path from the spawn to that goal (with ``--compare-shortcut``, both the plain
-  plan, dashed black, and the shortcut plan, solid red).
+- the planner's path from the spawn to that goal.
 
 ``--goal X,Y,YAW_DEG`` plans to that pose instead of the one ``find_goal`` gives.
 
 The map is loaded from ``map_graph.npz`` when the directory has one (built and saved otherwise).
 
-    uv run source/view_map.py --data data/<id> [--goal-camera auto|frame|photo]
-        [--goal X,Y,YAW_DEG] [--compare-shortcut] [--link-m M] [--out FILE] [--show]
+    uv run source/view_map.py --data data/<id> [--goal X,Y,YAW_DEG] [--link-m M] [--out FILE]
+        [--show]
 """
 
 from __future__ import annotations
@@ -29,13 +28,12 @@ import mapping
 import matplotlib
 import numpy as np
 import planner as planner_module
-from geometry import Camera, FloorMask
+from geometry import Camera, FloorMask, Pose
 from goal import find_goal
 
 WALL_LOG_ODDS = 2.0
 ARROW_M = 0.25
 """Length of a heading arrow."""
-Pose = tuple[float, float, float]
 
 
 def load(root: Path):
@@ -110,18 +108,12 @@ def draw(ax, store, spawn: Pose, goal: Pose | None, paths: list[tuple[object, st
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", required=True, help="exploration data directory")
-    parser.add_argument("--goal-camera", choices=("auto", "frame", "photo"), default="auto")
     parser.add_argument(
         "--goal",
         type=parse_pose,
         default=None,
         metavar="X,Y,YAW_DEG",
         help="plan to this pose instead of the one find_goal gives",
-    )
-    parser.add_argument(
-        "--compare-shortcut",
-        action="store_true",
-        help="draw the plain plan (dashed black) and the shortcut plan (solid red)",
     )
     parser.add_argument(
         "--link-m",
@@ -146,13 +138,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.goal is not None:
         goal: Pose | None = args.goal
     else:
-        found = find_goal(
-            map_agent.goal_views(root),
-            store,
-            camera,
-            floor,
-            photographed=args.goal_camera != "frame",
-        )
+        found = find_goal(map_agent.goal_views(root), store, camera, floor)
         goal = None if found is None else (found.x, found.y, found.yaw)
     path = None
     paths = []
@@ -161,10 +147,7 @@ def main(argv: list[str] | None = None) -> None:
             store, link_m=args.link_m, cache_path=root / "links.npz"
         )
         path = planner.plan(spawn, goal)
-        if path is not None and args.compare_shortcut:
-            short = path.shortcut(store)
-            paths = [(path, "plain plan", "k--"), (short, "shortcut plan", "r-")]
-        elif path is not None:
+        if path is not None:
             paths = [(path, "planned path", "k--")]
     goal_text = (
         "none"

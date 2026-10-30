@@ -36,8 +36,8 @@ FLOOR_MASK_PATH = ROOT / "data" / "floor_mask.npz"
 SEGMENT_SPAN = 16
 """manhattan_yaw: a segment joins columns this far apart. Neighbouring columns (1) see mostly the
 range's row quantisation: a run of columns on one row is a line across the camera's axis, so
-their histogram peaks at the yaw that makes it a wall (eval_geometry, mazes 7-9: a median error of
-21-25 degrees on renders and 11 on record frames at span 1; 0.6-1.0 and 0.7 at 16)."""
+their histogram peaks at the yaw that makes it a wall (legacy eval_geometry, mazes 7-9: a median
+error of 21-25 degrees on renders and 11 on record frames at span 1; 0.6-1.0 and 0.7 at 16)."""
 SEGMENT_MAX_GAP = 0.02
 """manhattan_yaw: segments longer than this per column of span, metres, cross a depth step (a
 corner or an opening) and are left out."""
@@ -62,7 +62,7 @@ SEARCH = (0.25, 0.25, 4.0)
 PRIOR_WEIGHT = 0.3
 """scan_match prefers poses near the prior: it maximises the score less this times the squared
 distance from the prior over the window's half-width, so a flat score along a corridor keeps
-the prior's position rather than wandering (eval_geometry's mapping: 0.05 drifts metres)."""
+the prior's position rather than wandering (legacy eval_geometry's mapping: 0.05 drifts metres)."""
 FINE_STEPS = 5
 """scan_match's fine level divides a coarse step (MAP_RES, 1 degree) into this many."""
 MANHATTAN_CONFIDENCE = 0.6
@@ -101,6 +101,9 @@ LAYOUT_RANGE_M = 1.2
 """layout_score: only the points this near a scan's origin are judged."""
 LAYOUT_MIN = 0.6
 """The layout score a fix or a goal needs to be believed."""
+
+Pose = tuple[float, float, float]
+"""``(x, y, yaw)``: metres and radians, yaw counter-clockwise from the x axis."""
 
 
 class Camera:
@@ -267,6 +270,23 @@ def snap(yaw: float, manhattan_deg: float) -> float:
     """The yaw, radians, of the form ``manhattan_deg`` + k 90 degrees nearest ``yaw``."""
     k = round((math.degrees(yaw) - manhattan_deg) / 90.0)
     return math.radians(manhattan_deg + 90.0 * k)
+
+
+def wrap(angle):
+    return (angle + math.pi) % (2 * math.pi) - math.pi
+
+
+def compose(a: Pose, b: Pose) -> Pose:
+    """The pose ``b`` (given in a's frame) in the frame ``a`` is in."""
+    c, s = math.cos(a[2]), math.sin(a[2])
+    return (a[0] + c * b[0] - s * b[1], a[1] + s * b[0] + c * b[1], wrap(a[2] + b[2]))
+
+
+def between(a: Pose, b: Pose) -> Pose:
+    """The pose of ``b`` in ``a``'s frame."""
+    c, s = math.cos(a[2]), math.sin(a[2])
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    return (c * dx + s * dy, -s * dx + c * dy, wrap(b[2] - a[2]))
 
 
 def transform(pose: tuple[float, float, float], local: np.ndarray) -> np.ndarray:
@@ -639,6 +659,25 @@ def wall_view(
 
 
 _MATCHER = cv2.BFMatcher(cv2.NORM_L2)
+
+
+def vlad(des: np.ndarray | None, centers: np.ndarray) -> np.ndarray:
+    """The VLAD vector (intra- and power-normalised) of RootSIFT ``des`` against the codebook
+    ``centers``: float32, zeros without descriptors."""
+    k, d = centers.shape
+    if des is None or not len(des):
+        return np.zeros(k * d, np.float32)
+    des = des.astype(np.float32)
+    distance = (centers**2).sum(axis=1)[None, :] - 2.0 * des @ centers.T
+    labels = distance.argmin(axis=1)
+    sums = np.zeros((k, d), np.float32)
+    np.add.at(sums, labels, des - centers[labels])
+    norms = np.linalg.norm(sums, axis=1, keepdims=True)
+    sums = np.divide(sums, norms, out=sums, where=norms > 0)
+    flat = sums.ravel()
+    flat = np.sign(flat) * np.sqrt(np.abs(flat))
+    norm = np.linalg.norm(flat)
+    return (flat / norm if norm > 0 else flat).astype(np.float32)
 
 
 def match_features(a: WallView, b: WallView, ratio: float = MATCH_RATIO) -> np.ndarray:

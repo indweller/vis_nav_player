@@ -2,8 +2,9 @@
 Online localisation on the frozen map, without ground truth: the pose ``(x, y, yaw)`` in the map
 frame and its uncertainty ``sigma_m``, from the camera frames and the actions taken.
 
-Each tick the pose is predicted by visual odometry against the previous frame (the action's
-calibrated mean motion where that fails) and snapped to the maze's axes, and sigma grows. Every
+Each tick the pose is predicted by visual odometry against the previous frame (where that fails,
+the median of the run's own visual odometry steps of the action once there are ONLINE_MIN, else
+its calibrated mean motion) and snapped to the maze's axes, and sigma grows. Every
 ``fix_every`` ticks a fix is tried: the VLAD top-10 of the mapped frames near the estimate,
 reranked by SIFT inliers, and with enough of them the rigid relative pose gives an absolute pose,
 blended with the estimate by their variances. A fix also needs the current frame's wall points to
@@ -24,12 +25,14 @@ from typing import NamedTuple
 import cv2
 import mapping
 import numpy as np
-from frozen_map import FrozenMap, vlad
+from frozen_map import FrozenMap
 from geometry import (
     LAYOUT_MIN,
     MANHATTAN_CONFIDENCE,
     Camera,
     FloorMask,
+    Pose,
+    compose,
     epipolar_inliers,
     layout_score,
     manhattan_yaw,
@@ -37,9 +40,10 @@ from geometry import (
     relative_pose,
     snap,
     visual_odometry,
+    vlad,
     wall_view,
+    wrap,
 )
-from mapping import compose, wrap
 
 START_SIGMA_M = 0.02
 DRIFT_M = 0.01
@@ -63,7 +67,6 @@ GREY_SIZE = (40, 30)
 ONLINE_MIN = 20
 """Successful visual odometry steps of an action before the online median replaces the
 calibrated motion."""
-CONTACT_ACTIONS = ("FORWARD", "BACKWARD")
 
 
 def grey_small(frame: np.ndarray) -> np.ndarray:
@@ -94,7 +97,7 @@ class Estimate(NamedTuple):
     """The robot is lost (it is searching all frames)."""
     layout: float = math.nan
     """The layout score of this tick's fix candidate (NaN without one)."""
-    candidate: mapping.Pose | None = None
+    candidate: Pose | None = None
     """This tick's fix candidate, whether or not the layout check passed it."""
 
 
@@ -110,31 +113,23 @@ class Localiser:
         lost_ticks: int = LOST_TICKS,
         lost_sigma: float = LOST_SIGMA_M,
         layout_min: float = LAYOUT_MIN,
-        blocked_zero: float | None = None,
-        online_motion: bool = False,
     ) -> None:
         """``camera`` is the one the map was built with (the horizon shift included). ``motion``
-        is mapping.calibrate's result, calibrated over the map's exploration frames if None.
-        ``blocked_zero``: when visual odometry fails on a FORWARD / BACKWARD tick and the frame
-        differs from the previous one by under this (``grey_difference``), the step is zero, not
-        the calibrated motion. ``online_motion``: the fallback is the median of the run's own
-        successful visual odometry steps of the action, once it has ONLINE_MIN."""
+        is mapping.calibrate's result, calibrated over the map's exploration frames if None."""
         self.map, self.camera, self.floor = frozen_map, camera, floor
         self.motion = motion or mapping.calibrate(frozen_map.sift.routes, camera, floor)
         self.fix_every, self.lost_ticks, self.lost_sigma = fix_every, lost_ticks, lost_sigma
         self.layout_min = layout_min
-        self.blocked_zero, self.online_motion = blocked_zero, online_motion
         self.samples: dict[str, list[tuple[float, float, float]]] = {}
-        """Successful visual odometry steps by action (kept always; used with online_motion)."""
+        """Successful visual odometry steps by action."""
         self.grey: np.ndarray | None = None
         self.grey_diff = math.nan
         """The grey difference of the latest frame to the one before (NaN: none)."""
         self.source: str | None = None
-        """How the latest step came: "vo", "calibrated", "online" or "zero" (None: no step)."""
-        self.zeroed = 0
+        """How the latest step came: "vo", "calibrated" or "online" (None: no step)."""
         self.sift = cv2.SIFT_create()
         self.rng = np.random.default_rng(0)
-        self.pose: mapping.Pose = (0.0, 0.0, 0.0)
+        self.pose: Pose = (0.0, 0.0, 0.0)
         self.sigma = START_SIGMA_M
         self.ticks = 0
         self.since_fix = 0
@@ -193,7 +188,7 @@ class Localiser:
             candidate,
         )
 
-    def _gate(self, fix: mapping.Pose) -> tuple[str, float, int]:
+    def _gate(self, fix: Pose) -> tuple[str, float, int]:
         """Take or hold ``fix``: ``(status, metres moved, held fixes dropped)``."""
         x, y, yaw = self.pose
         gap = (fix[0] - x, fix[1] - y, wrap(fix[2] - yaw))
@@ -218,13 +213,6 @@ class Localiser:
             self.source = "vo"
             if action:
                 self.samples.setdefault(action, []).append(step)
-        elif (
-            self.blocked_zero is not None
-            and action in CONTACT_ACTIONS
-            and self.grey_diff < self.blocked_zero
-        ):
-            step, self.source = (0.0, 0.0, 0.0), "zero"
-            self.zeroed += 1
         else:
             step = self.fallback(action)
         x, y, yaw = compose(self.pose, step)
@@ -244,7 +232,7 @@ class Localiser:
 
     def fallback(self, action: str | None) -> tuple[float, float, float]:
         """The motion assumed for ``action`` when visual odometry fails (and sets ``source``)."""
-        if self.online_motion and action and (median := self.online(action)) is not None:
+        if action and (median := self.online(action)) is not None:
             self.source = "online"
             return median
         self.source = "calibrated"
@@ -257,7 +245,7 @@ class Localiser:
         turns = [abs(math.degrees(m[2])) for a in ("LEFT", "RIGHT") if (m := self.online(a))]
         return float(np.mean(turns)) if turns else None
 
-    def _fix(self, view) -> tuple[mapping.Pose, float] | None:
+    def _fix(self, view) -> tuple[Pose, float] | None:
         """The absolute pose of ``view`` from the map and its layout score, or None: near the
         estimate, or over every frame when lost."""
         rows = np.arange(len(self.map.xy))
@@ -286,7 +274,7 @@ class Localiser:
         around = self.map.surroundings(self.map.neighbours(n, FIX_NEIGHBOURS), self.map.pose(n))
         return compose(self.map.pose(n), fit[0]), layout_score(around, view.points, fit[0])[0]
 
-    def _apply(self, fix: mapping.Pose, *, replace: bool) -> float:
+    def _apply(self, fix: Pose, *, replace: bool) -> float:
         """Blend the fix into the estimate (``replace`` it: a confirmed or lost-search fix);
         the metres it moved."""
         x, y, yaw = self.pose

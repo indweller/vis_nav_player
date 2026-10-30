@@ -9,7 +9,7 @@ No true poses, no simulator.
    Every route starts at the spawn, (0, 0, 0) for route 0; the others take route 0's position
    and the yaw of the SIFT match of their first frame to route 0's first START_FRAMES. The
    spawn's heading is taken to lie along a maze axis.
-2. Loop closures. VLAD (MyAgent's Float32VLAD, codebook fitted on these frames) of every
+2. Loop closures. geometry.vlad (VLAD_CLUSTERS centres fitted on these frames) of every
    NODE_EVERY-th frame; for every QUERY_EVERY-th, the TOP_K nearest nodes, not within
    EXCLUDE_TICKS of it on its route; kept with MIN_SIFT_INLIERS epipolar SIFT inliers, and a
    relative pose from the wall keypoints' rigid fit.
@@ -40,19 +40,22 @@ from geometry import (
     Camera,
     FloorMask,
     OccupancyMap,
+    Pose,
     WallView,
+    between,
     calibrate_motion,
     clip_range,
+    compose,
     epipolar_inliers,
     manhattan_yaw,
     match_features,
     relative_pose,
     snap,
     visual_odometry,
+    vlad,
     wall_view,
+    wrap,
 )
-from my_agent import Float32VLAD
-from paths import ROOT
 from scipy.optimize import least_squares
 from scipy.sparse import coo_matrix, csr_matrix
 from servo import Servo
@@ -86,6 +89,8 @@ wrong axis."""
 START_FRAMES = 60
 """Route 0's frames a later route's first frame is matched against, for its start yaw."""
 START_MIN_INLIERS = 15
+VLAD_CLUSTERS = 128
+"""The loop closures' VLAD codebook size."""
 CODEBOOK_DESCRIPTORS = 100_000
 HORIZON_SHIFT_PX = 1.0
 """Rows added to the camera's cy for the wall ranges. geometry.ranges reads the floor-wall
@@ -102,8 +107,6 @@ START_SIGMA_M, START_SIGMA_DEG = 0.001, 3.0
 """A route's start prior: the position is exact; the yaw is as sure as the SIFT match."""
 HUBER_SCALE = 2.0
 """The Huber loss's knee, in spreads."""
-
-Pose = tuple[float, float, float]
 
 
 class Images:
@@ -197,23 +200,6 @@ class Timer:
             yield
         finally:
             self.seconds[name] = self.seconds.get(name, 0.0) + time.perf_counter() - start
-
-
-def wrap(angle):
-    return (angle + math.pi) % (2 * math.pi) - math.pi
-
-
-def compose(a: Pose, b: Pose) -> Pose:
-    """The pose ``b`` (given in a's frame) in the frame ``a`` is in."""
-    c, s = math.cos(a[2]), math.sin(a[2])
-    return (a[0] + c * b[0] - s * b[1], a[1] + s * b[0] + c * b[1], wrap(a[2] + b[2]))
-
-
-def between(a: Pose, b: Pose) -> Pose:
-    """The pose of ``b`` in ``a``'s frame."""
-    c, s = math.cos(a[2]), math.sin(a[2])
-    dx, dy = b[0] - a[0], b[1] - a[1]
-    return (c * dx + s * dy, -s * dx + c * dy, wrap(b[2] - a[2]))
 
 
 # -- motion
@@ -328,25 +314,25 @@ def start_yaw(first: WallView, reference: list[tuple[WallView, float]], cx: floa
 # -- loop closures
 
 
-def fit_codebook(nodes: list[Node], extractor: Float32VLAD) -> None:
+def fit_codebook(nodes: list[Node]) -> np.ndarray:
+    """The VLAD codebook's ``(VLAD_CLUSTERS, 128)`` centres: k-means over up to
+    CODEBOOK_DESCRIPTORS of the nodes' descriptors."""
     descriptors = np.vstack([n.view.des for n in nodes if n.view.des is not None])
     rng = np.random.default_rng(0)
     if len(descriptors) > CODEBOOK_DESCRIPTORS:
         descriptors = descriptors[rng.choice(len(descriptors), CODEBOOK_DESCRIPTORS, False)]
-    extractor.codebook = KMeans(
-        n_clusters=extractor.n_clusters, n_init=1, max_iter=100, random_state=42
-    ).fit(descriptors)
+    kmeans = KMeans(n_clusters=VLAD_CLUSTERS, n_init=1, max_iter=100, random_state=42)
+    return kmeans.fit(descriptors).cluster_centers_.astype(np.float32)
 
 
-def find_closures(tracked: list[Tracked], timer: Timer) -> tuple[list[Closure], int, Float32VLAD]:
+def find_closures(tracked: list[Tracked], timer: Timer) -> tuple[list[Closure], int, np.ndarray]:
     """Verified loop closures between the routes' nodes, the candidates looked at, and the
-    VLAD extractor (codebook) fitted on the nodes."""
+    VLAD codebook's centres fitted on the nodes."""
     index = [(r, k) for r, t in enumerate(tracked) for k in range(len(t.nodes))]
     nodes = [tracked[r].nodes[k] for r, k in index]
     with timer.stage("vlad"):
-        extractor = Float32VLAD(cache_dir=ROOT / "cache" / "mapping")
-        fit_codebook(nodes, extractor)
-        database = np.array([extractor._vlad(n.view.des) for n in nodes], np.float32)
+        centers = fit_codebook(nodes)
+        database = np.array([vlad(n.view.des, centers) for n in nodes], np.float32)
     route = np.array([r for r, _ in index])
     frame = np.array([k * NODE_EVERY for _, k in index])
     queries = [q for q, (_, k) in enumerate(index) if (k * NODE_EVERY) % QUERY_EVERY == 0]
@@ -371,7 +357,7 @@ def find_closures(tracked: list[Tracked], timer: Timer) -> tuple[list[Closure], 
                 closure = verify(nodes[a].view, nodes[b].view, index[a], index[b], rng)
                 if closure is not None:
                     closures.append(closure)
-    return closures, candidates, extractor
+    return closures, candidates, centers
 
 
 def verify(
@@ -586,8 +572,7 @@ def build(
             poses = [t.poses[::NODE_EVERY] for t in tracked]
             result.variants["odom"] = Variant(poses, make_grid(tracked, poses))
     if "graph" in variants:
-        closures, result.candidates, extractor = find_closures(tracked, timer)
-        result.codebook = extractor.codebook.cluster_centers_.astype(np.float32)
+        closures, result.candidates, result.codebook = find_closures(tracked, timer)
         with timer.stage("optimise"):
             poses, kept = solve_rounds(tracked, starts, closures)
             for c in kept:

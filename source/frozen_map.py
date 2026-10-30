@@ -26,32 +26,24 @@ import caches
 import cv2
 import mapping
 import numpy as np
-from geometry import Camera, FloorMask, OccupancyMap, WallView, ranges, transform, wall_view
+from geometry import (
+    Camera,
+    FloorMask,
+    OccupancyMap,
+    WallView,
+    between,
+    compose,
+    ranges,
+    transform,
+    vlad,
+    wall_view,
+)
 from geometry import points as column_points
 from tqdm import tqdm
 
 MAP_NAME = "map_graph.npz"
 COLUMN_RANGE_M = 2.5
 """Column wall points further than this are not kept."""
-
-
-def vlad(des: np.ndarray | None, centers: np.ndarray) -> np.ndarray:
-    """The VLADExtractor's vector (intra- and power-normalised) of RootSIFT ``des`` against the
-    codebook ``centers``: float32, zeros without descriptors."""
-    k, d = centers.shape
-    if des is None or not len(des):
-        return np.zeros(k * d, np.float32)
-    des = des.astype(np.float32)
-    distance = (centers**2).sum(axis=1)[None, :] - 2.0 * des @ centers.T
-    labels = distance.argmin(axis=1)
-    sums = np.zeros((k, d), np.float32)
-    np.add.at(sums, labels, des - centers[labels])
-    norms = np.linalg.norm(sums, axis=1, keepdims=True)
-    sums = np.divide(sums, norms, out=sums, where=norms > 0)
-    flat = sums.ravel()
-    flat = np.sign(flat) * np.sqrt(np.abs(flat))
-    norm = np.linalg.norm(flat)
-    return (flat / norm if norm > 0 else flat).astype(np.float32)
 
 
 class SiftStore:
@@ -217,7 +209,7 @@ class FrozenMap:
         for n in rows:
             pose = self.pose(int(n))
             if origin is not None:
-                pose = mapping.between(origin, pose)
+                pose = between(origin, pose)
             out.append(transform(pose, self.sift.points(int(self.route[n]), int(self.frame[n]))))
         return np.concatenate(out) if out else np.empty((0, 2))
 
@@ -233,15 +225,13 @@ def every_frame_poses(result: mapping.MapResult) -> list[np.ndarray]:
         for f in range(len(dead)):
             n = f // mapping.NODE_EVERY
             base = n * mapping.NODE_EVERY
-            step = mapping.between(tuple(dead[base]), tuple(dead[f]))
-            poses[f] = mapping.compose(tuple(nodes[n]), step)
+            step = between(tuple(dead[base]), tuple(dead[f]))
+            poses[f] = compose(tuple(nodes[n]), step)
         out.append(poses)
     return out
 
 
-def freeze(
-    root: Path, routes: list[mapping.Route], camera_dict: dict, floor: FloorMask, path: Path
-) -> None:
+def freeze(routes: list[mapping.Route], camera_dict: dict, floor: FloorMask, path: Path) -> None:
     """Build the graph variant over ``routes`` and write ``path`` and the SIFT sidecar."""
     result = mapping.build(routes, camera_dict, floor, variants=("graph",))
     poses = every_frame_poses(result)
@@ -282,13 +272,12 @@ def load(path: Path, routes: list[mapping.Route], floor: FloorMask) -> FrozenMap
     with np.load(path) as data:
         n = int(data["routes"])
         poses = [data[f"poses_{r}"] for r in range(n)]
-        grid = OccupancyMap.__new__(OccupancyMap)
-        grid.log_odds, grid.origin, grid.res = data["log_odds"], data["origin"], float(data["res"])
         camera_dict = dict(zip(CAMERA_KEYS, data["camera"].tolist(), strict=True))
         camera_dict.update(width=int(camera_dict["width"]), height=int(camera_dict["height"]))
         centers, vlads = data["centers"], data["vlad"].astype(np.float32)
         saved = str(data["fingerprint"]) if "fingerprint" in data.files else None
     caches.check(path, saved, caches.fingerprint(caches.MAP, floor))
+    grid = OccupancyMap.load(path)  # the same file's log_odds, origin and res
     camera = Camera({**camera_dict, "cy": camera_dict["cy"] + mapping.HORIZON_SHIFT_PX})
     return FrozenMap(poses, grid, centers, vlads, SiftStore(routes, camera, floor, path.parent))
 
@@ -303,5 +292,5 @@ def get(
     if rebuild or not path.exists():
         for sidecar in [*root.glob("sift_r*.npz"), *root.glob("points_r*.npz")]:
             sidecar.unlink()
-        freeze(root, routes, camera_dict, floor, path)
+        freeze(routes, camera_dict, floor, path)
     return load(path, routes, floor), routes
