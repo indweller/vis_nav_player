@@ -1,7 +1,10 @@
 """Record the refactoring baseline into results/baseline/: what scripts/check_baseline.py
 recomputes and compares after a change.
 
-    uv run scripts/baseline.py
+    uv run scripts/baseline.py --record
+
+Without --record it refuses to run, so the reference is not overwritten by accident; with it, the
+current results/baseline/ is first copied to results/baseline/prev/.
 
 For each of DATA (the --test-local path: MapAgent's defaults, its frozen map and caches):
 find_goal's pose on target.jpg, a SHA-256 of the map's poses (the poses themselves go to
@@ -12,21 +15,20 @@ Writes baseline.json.
 
 from __future__ import annotations
 
+import argparse
 import csv
 import hashlib
 import json
 import math
+import shutil
 import subprocess
 import sys
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "source"))
-
-import numpy as np  # noqa: E402
-import planner as planner_module  # noqa: E402
-from goal import find_goal  # noqa: E402
-from map_agent import MapAgent, goal_views  # noqa: E402
+import numpy as np
+import planner as planner_module
+from goal import find_goal
+from map_agent import MapAgent, goal_views
+from paths import ROOT
 
 OUT = ROOT / "results" / "baseline"
 DATA = ("515b23a3c14a", "da90a443e215")
@@ -113,8 +115,22 @@ def record(tag: str) -> tuple[dict, dict[str, list[np.ndarray]]]:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--record", action="store_true", help="record, replacing the baseline (kept in prev/)"
+    )
+    if not parser.parse_args().record:
+        parser.error(f"this overwrites {OUT}; pass --record to record anyway")
     summary, poses = record("baseline")
     OUT.mkdir(parents=True, exist_ok=True)
+    previous = OUT / "prev"
+    shutil.rmtree(previous, ignore_errors=True)
+    previous.mkdir()
+    for path in OUT.iterdir():
+        if path.is_file():
+            shutil.copy2(path, previous / path.name)
     for name, p in poses.items():
         np.savez(OUT / f"poses_{name}.npz", *p)
     (OUT / "baseline.json").write_text(json.dumps(summary, indent=1))

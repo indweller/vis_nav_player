@@ -6,6 +6,7 @@ goal poses, map poses and plan lengths within TOLERANCE, the evaluation exactly.
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 
@@ -40,6 +41,9 @@ def differences(old, new, tolerance: float, where: str = "") -> list[str]:
 
 
 def main() -> None:
+    argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    ).parse_args()
     baseline = json.loads((OUT / "baseline.json").read_text())
     summary, poses = record("check")
     found = []
