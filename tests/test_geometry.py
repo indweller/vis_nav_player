@@ -4,17 +4,12 @@ calibration (on the simulator, skipped without it)."""
 from __future__ import annotations
 
 import math
-import sys
-from pathlib import Path
 
+import mapping
 import numpy as np
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "source"))
-
-import mapping  # noqa: E402
-from conftest import SEED  # noqa: E402
-from geometry import (  # noqa: E402
+from conftest import SEED
+from geometry import (
     CAMERA,
     FAR,
     FLOOR_MASK_PATH,

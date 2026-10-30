@@ -4,14 +4,10 @@ data/floor_mask.npz."""
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "source"))
-
-from geometry import FLOOR_MASK_PATH  # noqa: E402
+from geometry import FLOOR_MASK_PATH
 
 SEED = 7
 DRIVE = [("FORWARD", 40), ("LEFT", 15), ("FORWARD", 30), ("RIGHT", 15), ("FORWARD", 20)]

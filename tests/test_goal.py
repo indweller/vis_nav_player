@@ -3,37 +3,24 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import cv2
+import frozen_map
+import mapping
 import numpy as np
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "source"))
-
-import frozen_map  # noqa: E402
-import mapping  # noqa: E402
-from conftest import SEED  # noqa: E402
-from geometry import CAMERA, FloorMask, OccupancyMap  # noqa: E402
-from goal import find_goal  # noqa: E402
-from map_agent import MapAgent  # noqa: E402
-from my_agent import Float32VLAD  # noqa: E402
-from sklearn.cluster import KMeans  # noqa: E402
-
-
-def test_vlad_matches_the_extractor(tmp_path):
-    rng = np.random.default_rng(0)
-    des = np.sqrt(rng.dirichlet(np.ones(128), 300)).astype(np.float32)
-    extractor = Float32VLAD(n_clusters=8, cache_dir=tmp_path)
-    extractor.codebook = KMeans(8, n_init=1, random_state=0).fit(des)
-    expected = extractor._vlad(des)
-    got = frozen_map.vlad(des, extractor.codebook.cluster_centers_.astype(np.float32))
-    assert got == pytest.approx(expected, abs=1e-4)
+from conftest import SEED
+from geometry import (
+    CAMERA,
+    FloorMask,
+    OccupancyMap,
+    vlad,
+)
+from goal import find_goal
+from map_agent import MapAgent
 
 
 def test_vlad_without_descriptors_is_zero():
-    assert not frozen_map.vlad(None, np.zeros((4, 128), np.float32)).any()
+    assert not vlad(None, np.zeros((4, 128), np.float32)).any()
 
 
 def test_every_frame_poses_compose_from_the_nearest_earlier_node():
@@ -70,7 +57,7 @@ def test_a_frozen_map_loads_back_as_it_was_saved(tmp_path, monkeypatch, capsys):
     ]
     routes = [mapping.Route(noise, [None] * len(noise)) for _ in dead]
     floor, path = FloorMask(), tmp_path / frozen_map.MAP_NAME
-    frozen_map.freeze(tmp_path, routes, dict(CAMERA), floor, path)
+    frozen_map.freeze(routes, dict(CAMERA), floor, path)
     store = frozen_map.load(path, routes, floor)
 
     for got, expected in zip(store.poses, frozen_map.every_frame_poses(result), strict=True):

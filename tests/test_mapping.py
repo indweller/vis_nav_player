@@ -4,21 +4,17 @@ from __future__ import annotations
 
 import json
 import math
-import sys
-from pathlib import Path
 
 import cv2
+import mapping
 import numpy as np
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "source"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "source" / "eval"))
-
-import mapping  # noqa: E402
-from geometry import (  # noqa: E402
+from geometry import (
     Camera,
     FloorMask,
     WallView,
+    between,
+    compose,
     rigid_fit,
     rigid_ransac,
     transform,
@@ -117,7 +113,7 @@ def test_wall_view_ranges_keypoints_on_the_wall_only():
 
 def test_compose_and_between_are_inverse():
     a, b = (1.0, 2.0, 0.7), (-0.3, 0.9, -2.0)
-    assert mapping.compose(a, mapping.between(a, b)) == pytest.approx(b)
+    assert compose(a, between(a, b)) == pytest.approx(b)
 
 
 def test_optimise_pulls_a_loop_closed():
@@ -128,7 +124,7 @@ def test_optimise_pulls_a_loop_closed():
     poses.append((0.0, 0.0, 2 * math.pi))
     initial = np.array([(0.95 * x, 0.95 * y, yaw) for x, y, yaw in poses])
     edges = [(k, k + 1) for k in range(4)] + [(4, 0)]
-    measured = [mapping.between(poses[k], poses[k + 1]) for k in range(4)] + [(0.0, 0.0, 0.0)]
+    measured = [between(poses[k], poses[k + 1]) for k in range(4)] + [(0.0, 0.0, 0.0)]
     sigma = np.array([(0.05, 0.05)] * 4 + [(0.01, 0.01)])
     solved = mapping.optimise(
         initial,

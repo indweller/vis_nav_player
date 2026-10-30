@@ -3,18 +3,14 @@
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import caches
+import map_agent
 import numpy as np
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "source"))
-
-import caches  # noqa: E402
-import map_agent  # noqa: E402
-from geometry import FloorMask, WallView  # noqa: E402
-from planner import NODE_EVERY, PlaceGraph  # noqa: E402
+from geometry import FloorMask, WallView
+from planner import PLACE_EVERY, PlaceGraph
 
 MOTION = {"FORWARD": {"dx": 0.03, "dy": 0.0, "dyaw": 0.0, "std": [0, 0, 0], "n": [1, 1, 1]}}
 
@@ -60,7 +56,7 @@ def test_legacy_motion_warns_and_loads(tmp_path, capsys):
 
 def _links_graph(cache_path: Path) -> PlaceGraph:
     """Two parallel routes 0.1 m apart: links between them, each with no inliers."""
-    t = np.linspace(0, 0.9, 9 * NODE_EVERY + 1)
+    t = np.linspace(0, 0.9, 9 * PLACE_EVERY + 1)
     left = np.column_stack([0 * t, t, 0 * t])
     right = np.column_stack([0 * t + 0.1, t, 0 * t])
     empty = WallView(np.empty((0, 2), np.float32), None, np.empty((0, 2)), np.empty((0, 2)))

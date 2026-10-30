@@ -4,21 +4,15 @@ Manhattan snap) and the navigator's replans, on stubs: no map, no frames."""
 from __future__ import annotations
 
 import math
-import sys
-from pathlib import Path
 from types import SimpleNamespace
 
+import localiser as localiser_module
 import numpy as np
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "source"))
-
-import localiser as localiser_module  # noqa: E402
-from geometry import CAMERA, Camera, FloorMask  # noqa: E402
-from localiser import DRIFT_M, ONLINE_MIN, START_SIGMA_M, Estimate, Localiser  # noqa: E402
-from mapping import compose  # noqa: E402
-from navigator import Navigator  # noqa: E402
-from planner import Path as Route  # noqa: E402
+from geometry import CAMERA, Camera, FloorMask, compose
+from localiser import DRIFT_M, ONLINE_MIN, START_SIGMA_M, Estimate, Localiser
+from navigator import Navigator
+from planner import Path as Route
 
 MOTION = {
     "FORWARD": {"dx": 0.03, "dy": 0.0, "dyaw": 0.0},
@@ -31,9 +25,7 @@ VIEW = SimpleNamespace(points=np.empty((0, 2)))
 def predict(monkeypatch):
     """A Localiser and ``step(action, vo=None, manhattan=(nan, 0))``: one ``_predict`` with that
     visual odometry result and manhattan_yaw."""
-    localiser = Localiser(
-        SimpleNamespace(), Camera(CAMERA), FloorMask(), motion=MOTION, online_motion=True
-    )
+    localiser = Localiser(SimpleNamespace(), Camera(CAMERA), FloorMask(), motion=MOTION)
 
     def step(action, vo=None, manhattan=(math.nan, 0.0)):
         monkeypatch.setattr(localiser_module, "visual_odometry", lambda *a: vo)

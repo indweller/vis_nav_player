@@ -4,18 +4,13 @@ Needs the simulator's texture pack and data/floor_mask.npz, and is skipped witho
 from __future__ import annotations
 
 import math
-import sys
-from pathlib import Path
 from types import SimpleNamespace
 from typing import NamedTuple
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "source"))
-
-from conftest import SEED  # noqa: E402
-from map_agent import Config, MapAgent  # noqa: E402
-from vis_nav_sdk import run  # noqa: E402
+from conftest import SEED
+from map_agent import Config, MapAgent
+from vis_nav_sdk import run
 
 MAX_STEPS = 60
 
